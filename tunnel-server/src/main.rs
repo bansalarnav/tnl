@@ -1,4 +1,5 @@
 pub mod config;
+mod server;
 mod setup;
 
 use anyhow::Result;
@@ -13,14 +14,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Configure the public tunnel endpoint
     Setup,
+    Start {
+        #[arg(long)]
+        background: bool,
+    },
+    Stop,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Command::Setup => setup::run(),
+        Command::Start { background } => server::start(background).await,
+        Command::Stop => server::stop(),
     }
 }
