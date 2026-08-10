@@ -1,3 +1,4 @@
+pub mod config;
 mod setup;
 
 use anyhow::Result;
