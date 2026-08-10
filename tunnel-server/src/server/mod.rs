@@ -1,4 +1,7 @@
 mod api;
+mod http;
+mod tls;
+mod tunnel;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -7,9 +10,11 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::{Command, Stdio},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
+use rustls::ServerConfig;
 use tokio::net::TcpListener;
 
 use crate::config::Config;
@@ -60,6 +65,40 @@ fn get_config() -> Result<Config> {
     Config::get()
 }
 
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    domain: &str,
+    api_tls_config: Option<Arc<ServerConfig>>,
+) -> Result<()> {
+    let connection = match tls::inspect(stream).await? {
+        tls::Inspection::Plain(stream) => return http::serve(stream, api::router()).await,
+        tls::Inspection::Tls(connection) => connection,
+    };
+
+    let Some(server_name) = connection.server_name() else {
+        bail!("TLS connection did not include a server name");
+    };
+    let server_name = server_name.to_owned();
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+
+    if server_name == domain {
+        let Some(config) = api_tls_config else {
+            bail!("TLS termination for the server API is not configured yet");
+        };
+        let stream = connection.terminate(config).await?;
+        return http::serve(stream, api::router()).await;
+    }
+
+    let Some(tunnel_id) = server_name.strip_suffix(&format!(".{domain}")) else {
+        bail!("connection used an unknown server name: {server_name}");
+    };
+    if tunnel_id.is_empty() || tunnel_id.contains('.') {
+        bail!("invalid tunnel server name: {server_name}");
+    }
+
+    tunnel::forward(tunnel_id, connection).await
+}
+
 pub async fn start(background: bool) -> Result<()> {
     let config = get_config()?;
 
@@ -103,9 +142,22 @@ pub async fn start(background: bool) -> Result<()> {
         .await
         .with_context(|| format!("could not listen on {address}"))?;
 
-    println!("Server listening on http://{address}");
-    axum::serve(listener, api::router()).await?;
-    Ok(())
+    println!("Server listening on {address}");
+
+    // Setup does not provision an API certificate yet. Once it does, load its
+    // Rustls ServerConfig here; wildcard connections will continue to bypass it.
+    let api_tls_config: Option<Arc<ServerConfig>> = None;
+
+    loop {
+        let (stream, peer_address) = listener.accept().await?;
+        let domain = config.domain.clone();
+        let api_tls_config = api_tls_config.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_connection(stream, &domain, api_tls_config).await {
+                eprintln!("connection from {peer_address} failed: {error:#}");
+            }
+        });
+    }
 }
 
 pub fn stop() -> Result<()> {
