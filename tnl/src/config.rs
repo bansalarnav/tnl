@@ -5,7 +5,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-const LOGIN_BLOB_PREFIX: &str = "tunnel-login-v1.";
+const LOGIN_BLOB_PREFIX: &str = "tnl-login-v1.";
 
 #[derive(Deserialize)]
 struct LoginPayload {
@@ -41,15 +41,14 @@ pub fn login(blob: &str) -> Result<()> {
     let path = path()?;
     let directory = path
         .parent()
-        .context("client config path does not have a parent directory")?;
+        .context("tnl config path does not have a parent directory")?;
     fs::create_dir_all(directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
     let config = Config {
         api_url: payload.api_url,
         token: payload.token,
     };
-    let json =
-        serde_json::to_string_pretty(&config).context("could not serialize client config")?;
+    let json = serde_json::to_string_pretty(&config).context("could not serialize tnl config")?;
     fs::write(&path, format!("{json}\n"))
         .with_context(|| format!("could not write config to {}", path.display()))?;
 
@@ -79,5 +78,5 @@ pub fn read() -> Result<Config> {
 pub fn path() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("could not determine the home directory")?
-        .join(".tunnel/config.json"))
+        .join(".tnl/config.json"))
 }

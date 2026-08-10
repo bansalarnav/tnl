@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Client, Config};
 
-const LOGIN_BLOB_PREFIX: &str = "tunnel-login-v1.";
+const LOGIN_BLOB_PREFIX: &str = "tnl-login-v1.";
 
 #[derive(Serialize)]
 struct LoginPayload {

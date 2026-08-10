@@ -380,27 +380,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "dirs",
- "rand",
- "rustls",
- "rustls-acme",
- "serde",
- "serde_json",
- "socket2",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "url",
- "webpki-roots 1.0.9",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1636,6 +1615,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "tnl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "dirs",
+ "rand",
+ "rustls",
+ "rustls-acme",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "url",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "tnld"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "dirs",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "rand",
+ "rustls",
+ "rustls-acme",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "ureq",
+]
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1743,31 +1768,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
-]
-
-[[package]]
-name = "tunnel-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "clap",
- "dirs",
- "hyper",
- "hyper-util",
- "libc",
- "rand",
- "rustls",
- "rustls-acme",
- "serde",
- "serde_json",
- "sha2",
- "socket2",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "ureq",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(version, about = "Tunnel client")]
+#[command(version, about = "Expose local HTTP services through your tnld server")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

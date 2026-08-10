@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(version, about = "Tunnel server")]
+#[command(version, about = "Self-hosted server for tnl")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

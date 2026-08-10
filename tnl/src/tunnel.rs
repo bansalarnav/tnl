@@ -248,7 +248,7 @@ fn is_routine_connection_error(error: &anyhow::Error) -> bool {
 fn start_endpoint_tls(hostname: String, url: String, port: u16) -> Result<EndpointTls> {
     let cache_directory = config::path()?
         .parent()
-        .context("client config path does not have a parent directory")?
+        .context("tnl config path does not have a parent directory")?
         .join("acme");
     std::fs::create_dir_all(&cache_directory).with_context(|| {
         format!(

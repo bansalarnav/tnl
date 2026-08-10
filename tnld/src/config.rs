@@ -22,7 +22,7 @@ impl Config {
     pub fn path() -> Result<PathBuf> {
         Ok(dirs::home_dir()
             .context("could not determine the home directory")?
-            .join(".tunnel-server/config.json"))
+            .join(".tnld/config.json"))
     }
 
     pub fn get() -> Result<Self> {

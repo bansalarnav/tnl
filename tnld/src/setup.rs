@@ -81,7 +81,7 @@ pub fn run() -> Result<()> {
 
     let uses_nip_io = domain == "nip.io";
     let tunnel_domain = if uses_nip_io {
-        format!("tunnel-{}.nip.io", public_ip.to_string().replace('.', "-"))
+        format!("tnl-{}.nip.io", public_ip.to_string().replace('.', "-"))
     } else {
         domain
     };

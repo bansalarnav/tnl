@@ -2,9 +2,9 @@ Currently AI slop, read with caution
 
 -------- 
 
-# Tunnel
+# tnl
 
-Expose a local HTTP service through your own public tunnel server. The public endpoint uses HTTPS.
+Expose a local HTTP service through your own public `tnld` server. The public endpoint uses HTTPS.
 
 ## Requirements
 
@@ -17,8 +17,8 @@ Expose a local HTTP service through your own public tunnel server. The public en
 Clone this repository on the server, then run:
 
 ```sh
-cargo run --release -p tunnel-server -- setup
-cargo run --release -p tunnel-server -- start --background
+cargo run --release -p tnld -- setup
+cargo run --release -p tnld -- start --background
 ```
 
 Setup detects the server's public IP and defaults to a free `nip.io` domain. If you use your own domain, add the DNS records printed by the command. Certificate issuance requires public TCP port 443 to reach the configured listen port.
@@ -26,17 +26,17 @@ Setup detects the server's public IP and defaults to a free `nip.io` domain. If 
 Create credentials for a client:
 
 ```sh
-cargo run --release -p tunnel-server -- invite-client my-laptop
+cargo run --release -p tnld -- invite-client my-laptop
 ```
 
-Copy the `tunnel-login-v1...` value it prints.
+Copy the `tnl-login-v1...` value it prints.
 
 ## 2. Log in from your local machine
 
 Clone this repository locally and run:
 
 ```sh
-cargo run --release -p client -- login 'tunnel-login-v1...'
+cargo run --release -p tnl -- login 'tnl-login-v1...'
 ```
 
 ## 3. Expose a local service
@@ -44,17 +44,17 @@ cargo run --release -p client -- login 'tunnel-login-v1...'
 If your app is running on port 3000:
 
 ```sh
-cargo run --release -p client -- expose 3000
+cargo run --release -p tnl -- expose 3000
 ```
 
 The client prints the public HTTPS URL once it is ready. To request a memorable subdomain, add a name:
 
 ```sh
-cargo run --release -p client -- expose 3000 --name my-app
+cargo run --release -p tnl -- expose 3000 --name my-app
 ```
 
 Keep this command running while the tunnel is in use. To stop a background server later, run:
 
 ```sh
-cargo run --release -p tunnel-server -- stop
+cargo run --release -p tnld -- stop
 ```

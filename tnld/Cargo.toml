@@ -1,5 +1,5 @@
 [package]
-name = "tunnel-server"
+name = "tnld"
 version = "0.1.0"
 edition = "2024"
 
