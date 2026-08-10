@@ -1,11 +1,11 @@
-use std::{fs, io::Cursor, path::PathBuf, sync::Arc};
+use std::{fs, io::Cursor, path::PathBuf, sync::Arc, time::Duration};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context as _, Result, bail};
 use rustls::{ServerConfig, server::Acceptor};
-use rustls_acme::{AcmeConfig, caches::DirCache, is_tls_alpn_challenge};
+use rustls_acme::{AcmeConfig, EventError, caches::DirCache, is_tls_alpn_challenge};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -14,6 +14,7 @@ use tokio_rustls::{StartHandshake, server::TlsStream};
 use tokio_stream::StreamExt;
 
 const MAX_CLIENT_HELLO_LENGTH: usize = 64 * 1024;
+const ACME_ORDER_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 
 pub struct Configs {
     pub api: Arc<ServerConfig>,
@@ -51,7 +52,13 @@ pub fn manage_certificate(domain: &str, cache_directory: PathBuf) -> Result<Conf
         while let Some(event) = acme.next().await {
             match event {
                 Ok(event) => println!("ACME: {event:?}"),
-                Err(error) => eprintln!("ACME error: {error:?}"),
+                Err(error) => {
+                    eprintln!("ACME error: {error:?}");
+                    if matches!(error, EventError::Order(_)) {
+                        eprintln!("Retrying certificate order in 1 hour");
+                        tokio::time::sleep(ACME_ORDER_RETRY_DELAY).await;
+                    }
+                }
             }
         }
     });

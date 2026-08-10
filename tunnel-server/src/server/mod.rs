@@ -7,6 +7,7 @@ mod tunnel;
 use std::os::unix::process::CommandExt;
 use std::{
     fs::{self, File},
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::{Command, Stdio},
@@ -78,11 +79,11 @@ fn get_config() -> Result<Config> {
 async fn handle_connection(stream: tokio::net::TcpStream, state: &ServerState) -> Result<()> {
     let connection = match tls::inspect(stream).await? {
         Some(connection) => connection,
-        None => bail!("plaintext connections are not supported"),
+        None => return Ok(()),
     };
 
     let Some(server_name) = connection.server_name() else {
-        bail!("TLS connection did not include a server name");
+        return Ok(());
     };
     let domain = state.domain.as_str();
 
@@ -98,14 +99,41 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: &ServerState) -
     }
 
     let Some(tunnel_id) = server_name.strip_suffix(&state.wildcard_suffix) else {
-        bail!("connection used an unknown server name: {server_name}");
+        return Ok(());
     };
     if tunnel_id.is_empty() || tunnel_id.contains('.') {
-        bail!("invalid tunnel server name: {server_name}");
+        return Ok(());
     }
     let tunnel_id = tunnel_id.to_owned();
 
     state.tunnels.forward(&tunnel_id, connection).await
+}
+
+fn is_routine_connection_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<io::Error>() {
+            return matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+            );
+        }
+
+        cause.downcast_ref::<rustls::Error>().is_some_and(|error| {
+            matches!(
+                error,
+                rustls::Error::InappropriateMessage { .. }
+                    | rustls::Error::InappropriateHandshakeMessage { .. }
+                    | rustls::Error::InvalidMessage(_)
+                    | rustls::Error::PeerIncompatible(_)
+                    | rustls::Error::PeerMisbehaved(_)
+                    | rustls::Error::AlertReceived(_)
+                    | rustls::Error::NoApplicationProtocol
+            )
+        })
+    })
 }
 
 pub async fn start(background: bool) -> Result<()> {
@@ -170,7 +198,9 @@ pub async fn start(background: bool) -> Result<()> {
         let (stream, peer_address) = listener.accept().await?;
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, &state).await {
+            if let Err(error) = handle_connection(stream, &state).await
+                && !is_routine_connection_error(&error)
+            {
                 eprintln!("connection from {peer_address} failed: {error:#}");
             }
         });

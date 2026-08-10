@@ -149,7 +149,7 @@ impl TunnelRegistry {
         let (owner, sender) = {
             let state = self.state.lock().await;
             let Some(tunnel) = state.tunnels.get(tunnel_id) else {
-                bail!("no tunnel client is connected for {tunnel_id}");
+                return Ok(());
             };
             (tunnel.owner.clone(), tunnel.sender.clone())
         };
