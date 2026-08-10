@@ -1,11 +1,20 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
+use rand::{Rng, distributions::Alphanumeric};
+use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use serde::{Deserialize, Serialize};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
+    net::TcpStream,
+};
+use tokio_rustls::{TlsConnector, client::TlsStream};
+use url::{Host, Url};
 
 const LOGIN_BLOB_PREFIX: &str = "tunnel-login-v1.";
+const MAX_HTTP_RESPONSE_HEADER_LENGTH: usize = 16 * 1024;
 
 #[derive(Parser)]
 #[command(version, about = "Tunnel client")]
@@ -16,7 +25,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Login { blob: String },
+    Login {
+        blob: String,
+    },
+    Expose {
+        port: u16,
+        #[arg(short, long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -25,15 +41,24 @@ struct LoginPayload {
     token: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Config {
     api_url: String,
     token: String,
 }
 
-fn main() -> Result<()> {
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ControlMessage {
+    Ready { url: String },
+    Connection { id: String },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Login { blob } => login(&blob),
+        Command::Expose { port, name } => expose(port, name).await,
     }
 }
 
@@ -48,13 +73,12 @@ fn login(blob: &str) -> Result<()> {
     let payload: LoginPayload = serde_json::from_slice(&json)
         .with_context(|| format!("not a valid {LOGIN_BLOB_PREFIX}* login blob"))?;
 
-    let api_url =
-        url::Url::parse(&payload.api_url).context("login blob contains an invalid API URL")?;
+    let api_url = Url::parse(&payload.api_url).context("login blob contains an invalid API URL")?;
     if api_url.scheme() != "https" || api_url.host().is_none() {
         bail!("login blob API URL must be an HTTPS URL with a host");
     }
-    if payload.token.is_empty() {
-        bail!("login blob contains an empty token");
+    if payload.token.is_empty() || payload.token.chars().any(char::is_control) {
+        bail!("login blob contains an invalid token");
     }
 
     let path = config_path()?;
@@ -80,6 +104,195 @@ fn login(blob: &str) -> Result<()> {
 
     println!("Logged in to {}", config.api_url);
     println!("Configuration saved to {}", path.display());
+    Ok(())
+}
+
+async fn expose(port: u16, name: Option<String>) -> Result<()> {
+    if port == 0 {
+        bail!("port must be between 1 and 65535");
+    }
+
+    let config = Arc::new(read_config()?);
+    let tunnel_id = match name {
+        Some(name) => {
+            let name = name.to_ascii_lowercase();
+            validate_tunnel_id(&name)?;
+            name
+        }
+        None => default_tunnel_id()?,
+    };
+
+    let control_stream = open_tunnel_connection(&config, &tunnel_id).await?;
+    let mut messages = BufReader::new(control_stream).lines();
+
+    while let Some(line) = messages.next_line().await? {
+        match serde_json::from_str::<ControlMessage>(&line).context("invalid server message")? {
+            ControlMessage::Ready { url } => {
+                println!("Forwarding {url} to 127.0.0.1:{port}");
+            }
+            ControlMessage::Connection { id } => {
+                let config = Arc::clone(&config);
+                tokio::spawn(async move {
+                    if let Err(error) = forward_connection(&config, port, &id).await {
+                        eprintln!("connection {id} failed: {error:#}");
+                    }
+                });
+            }
+        }
+    }
+
+    bail!("tunnel server closed the control connection")
+}
+
+async fn forward_connection(config: &Config, port: u16, connection_id: &str) -> Result<()> {
+    let mut tunnel_stream =
+        open_api_connection(config, &format!("/v1/connections/{connection_id}")).await?;
+    let mut local_stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("could not connect to 127.0.0.1:{port}"))?;
+
+    copy_bidirectional(&mut tunnel_stream, &mut local_stream)
+        .await
+        .context("could not forward tunnel connection")?;
+    Ok(())
+}
+
+async fn open_tunnel_connection(config: &Config, tunnel_id: &str) -> Result<TlsStream<TcpStream>> {
+    open_api_connection(config, &format!("/v1/tunnels/{tunnel_id}"))
+        .await
+        .with_context(|| format!("could not register tunnel {tunnel_id}"))
+}
+
+async fn open_api_connection(config: &Config, path: &str) -> Result<TlsStream<TcpStream>> {
+    let api_url = Url::parse(&config.api_url).context("config contains an invalid API URL")?;
+    if api_url.scheme() != "https" {
+        bail!("config API URL must use HTTPS");
+    }
+    if config.token.is_empty() || config.token.chars().any(char::is_control) {
+        bail!("config contains an invalid token");
+    }
+
+    let host = api_url
+        .host_str()
+        .context("config API URL does not contain a host")?;
+    let port = api_url
+        .port_or_known_default()
+        .context("config API URL does not contain a port")?;
+    let tcp_stream = TcpStream::connect((host, port))
+        .await
+        .with_context(|| format!("could not connect to {host}:{port}"))?;
+
+    let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(host.to_owned()).context("invalid API hostname")?;
+    let mut stream = TlsConnector::from(Arc::new(tls_config))
+        .connect(server_name, tcp_stream)
+        .await
+        .context("could not establish TLS with the tunnel server")?;
+
+    let host_header = match api_url.host().expect("host was checked above") {
+        Host::Ipv6(address) => format!("[{address}]:{port}"),
+        _ => format!("{host}:{port}"),
+    };
+    let request = format!(
+        "CONNECT {path} HTTP/1.1\r\nHost: {host_header}\r\nAuthorization: Bearer {}\r\n\r\n",
+        config.token
+    );
+    stream.write_all(request.as_bytes()).await?;
+
+    let response_header = read_http_response_header(&mut stream).await?;
+    let status_line = response_header
+        .lines()
+        .next()
+        .context("tunnel server returned an empty HTTP response")?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .context("tunnel server returned an invalid HTTP status")?;
+    if !(200..300).contains(&status) {
+        bail!("tunnel server rejected the connection ({status_line})");
+    }
+
+    Ok(stream)
+}
+
+async fn read_http_response_header(stream: &mut TlsStream<TcpStream>) -> Result<String> {
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        if header.len() == MAX_HTTP_RESPONSE_HEADER_LENGTH {
+            bail!("tunnel server HTTP response header is too large");
+        }
+        let mut byte = [0];
+        stream
+            .read_exact(&mut byte)
+            .await
+            .context("tunnel server closed the connection during the HTTP response")?;
+        header.push(byte[0]);
+    }
+    String::from_utf8(header).context("tunnel server returned a non-UTF-8 HTTP response")
+}
+
+fn read_config() -> Result<Config> {
+    let path = config_path()?;
+    let json = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "could not read config from {}; log in first",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&json)
+        .with_context(|| format!("could not parse config from {}", path.display()))
+}
+
+fn default_tunnel_id() -> Result<String> {
+    let directory = std::env::current_dir().context("could not determine current directory")?;
+    let name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_tunnel_id)
+        .filter(|name| !name.is_empty());
+
+    Ok(name.unwrap_or_else(|| {
+        rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .filter(|byte| byte.is_ascii_alphanumeric())
+            .take(8)
+            .map(char::from)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    }))
+}
+
+fn sanitize_tunnel_id(value: &str) -> String {
+    let mut result = String::new();
+    let mut previous_was_separator = false;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            result.push(character);
+            previous_was_separator = false;
+        } else if !previous_was_separator && !result.is_empty() {
+            result.push('-');
+            previous_was_separator = true;
+        }
+    }
+    result.truncate(63);
+    result.trim_end_matches('-').to_owned()
+}
+
+fn validate_tunnel_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 63
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("tunnel name must contain only lowercase letters, numbers, and internal hyphens");
+    }
     Ok(())
 }
 

@@ -387,9 +387,14 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "dirs",
+ "rand",
+ "rustls",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-rustls",
  "url",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

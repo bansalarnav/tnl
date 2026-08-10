@@ -26,6 +26,7 @@ struct ServerState {
     api_tls_config: Arc<ServerConfig>,
     acme_tls_config: Arc<ServerConfig>,
     api_router: Router,
+    tunnels: tunnel::Registry,
 }
 
 fn state_directory() -> Result<PathBuf> {
@@ -104,7 +105,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: &ServerState) -
     }
     let tunnel_id = tunnel_id.to_owned();
 
-    tunnel::forward(&tunnel_id, connection).await
+    state.tunnels.forward(&tunnel_id, connection).await
 }
 
 pub async fn start(background: bool) -> Result<()> {
@@ -148,12 +149,14 @@ pub async fn start(background: bool) -> Result<()> {
     let domain = config.domain.trim_end_matches('.').to_ascii_lowercase();
     let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
 
+    let tunnels = tunnel::Registry::new(domain.clone());
     let state = Arc::new(ServerState {
         wildcard_suffix: format!(".{domain}"),
         domain,
         api_tls_config: tls_configs.api,
         acme_tls_config: tls_configs.acme_challenge,
-        api_router: api::router(),
+        api_router: api::router(tunnels.clone()),
+        tunnels,
     });
 
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.listen_port);

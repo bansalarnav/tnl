@@ -11,7 +11,7 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     auto::Builder::new(TokioExecutor::new())
-        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router))
+        .serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(router))
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
     Ok(())
