@@ -12,11 +12,13 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use rustls::ServerConfig;
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 use crate::config::Config;
@@ -29,6 +31,10 @@ struct ServerState {
     api_router: Router,
     tunnels: tunnel::TunnelRegistry,
 }
+
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 fn state_directory() -> Result<PathBuf> {
     Config::path()?
@@ -196,6 +202,9 @@ pub async fn start(background: bool) -> Result<()> {
 
     loop {
         let (stream, peer_address) = listener.accept().await?;
+        if let Err(error) = configure_tcp_keepalive(&stream) {
+            eprintln!("could not configure TCP keepalive for {peer_address}: {error}");
+        }
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             if let Err(error) = handle_connection(stream, &state).await
@@ -205,6 +214,15 @@ pub async fn start(background: bool) -> Result<()> {
             }
         });
     }
+}
+
+fn configure_tcp_keepalive(stream: &tokio::net::TcpStream) -> io::Result<()> {
+    SockRef::from(stream).set_tcp_keepalive(
+        &TcpKeepalive::new()
+            .with_time(TCP_KEEPALIVE_IDLE)
+            .with_interval(TCP_KEEPALIVE_INTERVAL)
+            .with_retries(TCP_KEEPALIVE_RETRIES),
+    )
 }
 
 pub fn stop() -> Result<()> {

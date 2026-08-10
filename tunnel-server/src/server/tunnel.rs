@@ -4,16 +4,18 @@ use anyhow::{Context, Result, bail};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use rand::{Rng, distributions::Alphanumeric};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy_bidirectional},
     sync::{Mutex, mpsc, oneshot},
-    time::timeout,
+    time::{Instant, MissedTickBehavior, interval_at, timeout},
 };
 
 use super::tls::TlsConnection;
 
 const DATA_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct TunnelRegistry {
@@ -43,6 +45,13 @@ struct PendingConnection {
 enum ControlMessage<'a> {
     Ready { url: &'a str },
     Connection { id: &'a str },
+    Ping,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClientControlMessage {
+    Pong,
 }
 
 pub struct Registration {
@@ -116,18 +125,28 @@ impl TunnelRegistry {
         mut receiver: mpsc::Receiver<String>,
         upgraded: Upgraded,
     ) -> Result<()> {
-        let (mut reader, mut writer) = tokio::io::split(TokioIo::new(upgraded));
+        let (reader, mut writer) = tokio::io::split(TokioIo::new(upgraded));
+        let mut reader = BufReader::new(reader);
         let url = format!("https://{tunnel_id}.{}", self.domain);
         write_message(&mut writer, &ControlMessage::Ready { url: &url }).await?;
 
-        let mut unexpected_input = [0];
+        let mut heartbeat = interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_pong = Instant::now();
+        let mut line = String::new();
+
         loop {
             tokio::select! {
-                result = reader.read(&mut unexpected_input) => {
-                    match result? {
-                        0 => break,
-                        _ => bail!("tunnel client sent unexpected control data"),
+                result = reader.read_line(&mut line) => {
+                    if result? == 0 {
+                        break;
                     }
+                    match serde_json::from_str::<ClientControlMessage>(&line)
+                        .context("tunnel client sent an invalid control message")?
+                    {
+                        ClientControlMessage::Pong => last_pong = Instant::now(),
+                    }
+                    line.clear();
                 }
                 connection_id = receiver.recv() => {
                     let Some(connection_id) = connection_id else {
@@ -138,6 +157,12 @@ impl TunnelRegistry {
                         &ControlMessage::Connection { id: &connection_id },
                     )
                     .await?;
+                }
+                _ = heartbeat.tick() => {
+                    if last_pong.elapsed() >= HEARTBEAT_TIMEOUT {
+                        bail!("tunnel client missed the heartbeat deadline");
+                    }
+                    write_message(&mut writer, &ControlMessage::Ping).await?;
                 }
             }
         }

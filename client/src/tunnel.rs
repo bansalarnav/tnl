@@ -1,14 +1,16 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{error::Error, fmt, io, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use rand::{Rng, distributions::Alphanumeric};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::ServerName};
 use rustls_acme::{AcmeConfig, EventError, EventOk, caches::DirCache, is_tls_alpn_challenge};
 use serde::Deserialize;
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
     net::TcpStream,
     sync::watch,
+    time::Instant,
 };
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector, client::TlsStream};
 use tokio_stream::StreamExt;
@@ -18,20 +20,48 @@ use crate::config::{self, Config};
 
 const MAX_HTTP_RESPONSE_HEADER_LENGTH: usize = 16 * 1024;
 const ACME_ORDER_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+const RECONNECT_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
+const RECONNECT_JITTER_MAX_MILLIS: u64 = 250;
+const PONG_MESSAGE: &[u8] = b"{\"type\":\"pong\"}\n";
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ControlMessage {
     Ready { url: String },
     Connection { id: String },
+    Ping,
 }
 
 #[derive(Clone)]
 struct EndpointTls {
+    hostname: Arc<str>,
     regular: Arc<ServerConfig>,
     challenge: Arc<ServerConfig>,
     certificate_ready: watch::Receiver<bool>,
 }
+
+#[derive(Debug)]
+struct ApiRejection {
+    status: u16,
+    status_line: String,
+}
+
+impl fmt::Display for ApiRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "tunnel server rejected the connection ({})",
+            self.status_line
+        )
+    }
+}
+
+impl Error for ApiRejection {}
 
 pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
     if port == 0 {
@@ -48,9 +78,51 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
         None => default_tunnel_id()?,
     };
 
-    let control_stream = open_tunnel_connection(&config, &tunnel_id).await?;
-    let mut messages = BufReader::new(control_stream).lines();
     let mut endpoint_tls = None;
+    let mut has_registered = false;
+    let mut reconnect_delay = RECONNECT_INITIAL_DELAY;
+
+    loop {
+        let session_started = Instant::now();
+        let result = run_control_session(
+            Arc::clone(&config),
+            &tunnel_id,
+            port,
+            &mut endpoint_tls,
+            &mut has_registered,
+        )
+        .await;
+
+        let error = result.expect_err("control sessions only end when their connection fails");
+        if registration_error_is_fatal(&error, has_registered) {
+            return Err(error);
+        }
+
+        if session_started.elapsed() >= RECONNECT_BACKOFF_RESET_AFTER {
+            reconnect_delay = RECONNECT_INITIAL_DELAY;
+        }
+        let jitter =
+            Duration::from_millis(rand::thread_rng().r#gen_range(0..=RECONNECT_JITTER_MAX_MILLIS));
+        eprintln!(
+            "Tunnel connection lost: {error:#}\nReconnecting in {:.1}s...",
+            (reconnect_delay + jitter).as_secs_f32()
+        );
+        tokio::time::sleep(reconnect_delay + jitter).await;
+        reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX_DELAY);
+    }
+}
+
+async fn run_control_session(
+    config: Arc<Config>,
+    tunnel_id: &str,
+    port: u16,
+    endpoint_tls: &mut Option<EndpointTls>,
+    has_registered: &mut bool,
+) -> Result<()> {
+    let control_stream = open_tunnel_connection(&config, tunnel_id).await?;
+    *has_registered = true;
+    let (reader, mut writer) = tokio::io::split(control_stream);
+    let mut messages = BufReader::new(reader).lines();
 
     while let Some(line) = messages.next_line().await? {
         match serde_json::from_str::<ControlMessage>(&line).context("invalid server message")? {
@@ -60,8 +132,19 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
                     .host_str()
                     .context("server tunnel URL did not contain a hostname")?
                     .to_owned();
-                println!("Obtaining a TLS certificate for {hostname}...");
-                endpoint_tls = Some(start_endpoint_tls(hostname, url, port)?);
+
+                if let Some(endpoint_tls) = endpoint_tls {
+                    if endpoint_tls.hostname.as_ref() != hostname {
+                        bail!(
+                            "tunnel hostname changed from {} to {hostname}",
+                            endpoint_tls.hostname
+                        );
+                    }
+                    println!("Reconnected {url}");
+                } else {
+                    println!("Obtaining a TLS certificate for {hostname}...");
+                    *endpoint_tls = Some(start_endpoint_tls(hostname, url, port)?);
+                }
             }
             ControlMessage::Connection { id } => {
                 let endpoint_tls = endpoint_tls
@@ -76,6 +159,10 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
                     }
                 });
             }
+            ControlMessage::Ping => writer
+                .write_all(PONG_MESSAGE)
+                .await
+                .context("could not answer tunnel heartbeat")?,
         }
     }
 
@@ -181,6 +268,7 @@ fn start_endpoint_tls(hostname: String, url: String, port: u16) -> Result<Endpoi
         .state();
     let (certificate_ready, certificate_status) = watch::channel(false);
     let endpoint_tls = EndpointTls {
+        hostname: Arc::from(hostname.as_str()),
         regular: state.default_rustls_config(),
         challenge: state.challenge_rustls_config(),
         certificate_ready: certificate_status,
@@ -232,6 +320,8 @@ async fn open_api_connection(config: &Config, path: &str) -> Result<TlsStream<Tc
     let tcp_stream = TcpStream::connect((host, port))
         .await
         .with_context(|| format!("could not connect to {host}:{port}"))?;
+    configure_tcp_keepalive(&tcp_stream)
+        .with_context(|| format!("could not configure TCP keepalive for {host}:{port}"))?;
 
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let tls_config = ClientConfig::builder()
@@ -264,10 +354,31 @@ async fn open_api_connection(config: &Config, path: &str) -> Result<TlsStream<Tc
         .and_then(|value| value.parse::<u16>().ok())
         .context("tunnel server returned an invalid HTTP status")?;
     if !(200..300).contains(&status) {
-        bail!("tunnel server rejected the connection ({status_line})");
+        return Err(ApiRejection {
+            status,
+            status_line: status_line.to_owned(),
+        }
+        .into());
     }
 
     Ok(stream)
+}
+
+fn registration_error_is_fatal(error: &anyhow::Error, has_registered: bool) -> bool {
+    error
+        .downcast_ref::<ApiRejection>()
+        .is_some_and(|rejection| {
+            (400..500).contains(&rejection.status) && !(rejection.status == 409 && has_registered)
+        })
+}
+
+fn configure_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {
+    SockRef::from(stream).set_tcp_keepalive(
+        &TcpKeepalive::new()
+            .with_time(TCP_KEEPALIVE_IDLE)
+            .with_interval(TCP_KEEPALIVE_INTERVAL)
+            .with_retries(TCP_KEEPALIVE_RETRIES),
+    )
 }
 
 async fn read_http_response_header(stream: &mut TlsStream<TcpStream>) -> Result<String> {
