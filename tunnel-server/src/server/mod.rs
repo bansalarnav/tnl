@@ -10,21 +10,21 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::{Command, Stdio},
-    rc::Rc,
     sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use rustls::ServerConfig;
-use tokio::net::TcpListener;
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 use crate::config::Config;
 
 struct ServerState {
     domain: String,
     wildcard_suffix: String,
-    api_tls_config: Option<Arc<ServerConfig>>,
+    api_tls_config: Arc<ServerConfig>,
+    acme_tls_config: Arc<ServerConfig>,
     api_router: Router,
 }
 
@@ -76,10 +76,8 @@ fn get_config() -> Result<Config> {
 
 async fn handle_connection(stream: tokio::net::TcpStream, state: &ServerState) -> Result<()> {
     let connection = match tls::inspect(stream).await? {
-        tls::Inspection::Plain(stream) => {
-            return http::serve(stream, state.api_router.clone()).await;
-        }
-        tls::Inspection::Tls(connection) => connection,
+        Some(connection) => connection,
+        None => bail!("plaintext connections are not supported"),
     };
 
     let Some(server_name) = connection.server_name() else {
@@ -87,11 +85,14 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: &ServerState) -
     };
     let domain = state.domain.as_str();
 
+    if server_name == domain && connection.is_acme_challenge() {
+        let mut stream = connection.terminate(state.acme_tls_config.clone()).await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
     if server_name == domain {
-        let Some(config) = state.api_tls_config.clone() else {
-            bail!("TLS termination for the server API is not configured yet");
-        };
-        let stream = connection.terminate(config).await?;
+        let stream = connection.terminate(state.api_tls_config.clone()).await?;
         return http::serve(stream, state.api_router.clone()).await;
     }
 
@@ -144,22 +145,23 @@ pub async fn start(background: bool) -> Result<()> {
         return Ok(());
     }
 
+    let domain = config.domain.trim_end_matches('.').to_ascii_lowercase();
+    let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
+
+    let state = Arc::new(ServerState {
+        wildcard_suffix: format!(".{domain}"),
+        domain,
+        api_tls_config: tls_configs.api,
+        acme_tls_config: tls_configs.acme_challenge,
+        api_router: api::router(),
+    });
+
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.listen_port);
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("could not listen on {address}"))?;
 
     println!("Server listening on {address}");
-
-    // Setup does not provision an API certificate yet. Once it does, load its
-    // Rustls ServerConfig here; wildcard connections will continue to bypass it.
-    let domain = config.domain.trim_end_matches('.').to_ascii_lowercase();
-    let state = Arc::new(ServerState {
-        wildcard_suffix: format!(".{domain}"),
-        domain,
-        api_tls_config: None,
-        api_router: api::router(),
-    });
 
     loop {
         let (stream, peer_address) = listener.accept().await?;

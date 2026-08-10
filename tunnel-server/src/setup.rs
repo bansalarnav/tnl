@@ -61,7 +61,8 @@ pub fn run() -> Result<()> {
 
         if value == "nip.io" && public_ip.is_ipv6() {
             println!("nip.io setup requires an IPv4 address. Enter a custom domain.");
-        } else if value.contains(char::is_whitespace) || !value.contains('.') {
+        } else if value.contains(char::is_whitespace) || value.contains('*') || !value.contains('.')
+        {
             println!("Please enter a valid base domain.");
         } else {
             break value;
@@ -96,6 +97,8 @@ pub fn run() -> Result<()> {
     };
 
     println!("\nBrowser URL: https://<tunnel-id>.{tunnel_domain}{port_suffix}");
+    // println!("API URL: https://{tunnel_domain}{port_suffix}");
+    // println!("API certificate: issued automatically for {tunnel_domain} on server start");
     println!("Listen address: {listen_address}");
 
     if uses_nip_io {
@@ -113,7 +116,13 @@ pub fn run() -> Result<()> {
         println!("Value: {tunnel_domain}");
     }
 
-    println!("\nMake sure the server is accessible from the internet on TCP port {listen_port}.");
+    if listen_port == 443 {
+        println!("\nMake sure TCP port 443 is publicly accessible.");
+    } else {
+        println!(
+            "\nMake sure TCP port 443 is publicly accessible and correctly forwards to port {listen_port}."
+        );
+    }
     println!(
         "Make sure DNS proxying is disabled. If a proxy terminates TLS, the tunnel will not be end-to-end encrypted."
     );

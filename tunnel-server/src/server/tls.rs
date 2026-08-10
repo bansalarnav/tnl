@@ -1,23 +1,62 @@
-use std::{
-    io::{self, Cursor},
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::{fs, io::Cursor, path::PathBuf, sync::Arc};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context as _, Result, bail};
 use rustls::{ServerConfig, server::Acceptor};
+use rustls_acme::{AcmeConfig, caches::DirCache, is_tls_alpn_challenge};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 use tokio_rustls::{StartHandshake, server::TlsStream};
+use tokio_stream::StreamExt;
 
 const MAX_CLIENT_HELLO_LENGTH: usize = 64 * 1024;
 
-pub enum Inspection {
-    Plain(PrefixedStream),
-    Tls(TlsConnection),
+pub struct Configs {
+    pub api: Arc<ServerConfig>,
+    pub acme_challenge: Arc<ServerConfig>,
+}
+
+pub fn manage_certificate(domain: &str, cache_directory: PathBuf) -> Result<Configs> {
+    fs::create_dir_all(&cache_directory).with_context(|| {
+        format!(
+            "could not create ACME cache directory {}",
+            cache_directory.display()
+        )
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(&cache_directory, fs::Permissions::from_mode(0o700)).with_context(
+        || {
+            format!(
+                "could not secure ACME cache directory {}",
+                cache_directory.display()
+            )
+        },
+    )?;
+
+    let mut acme = AcmeConfig::new([domain.to_owned()])
+        .cache(DirCache::new(cache_directory))
+        .directory_lets_encrypt(true)
+        .state();
+    let configs = Configs {
+        api: acme.default_rustls_config(),
+        acme_challenge: acme.challenge_rustls_config(),
+    };
+
+    println!("Managing TLS certificate for {domain}");
+    tokio::spawn(async move {
+        while let Some(event) = acme.next().await {
+            match event {
+                Ok(event) => println!("ACME: {event:?}"),
+                Err(error) => eprintln!("ACME error: {error:?}"),
+            }
+        }
+    });
+
+    Ok(configs)
 }
 
 pub struct TlsConnection {
@@ -32,11 +71,15 @@ impl TlsConnection {
         self.server_name.as_deref()
     }
 
+    pub fn is_acme_challenge(&self) -> bool {
+        is_tls_alpn_challenge(&self.accepted.client_hello())
+    }
+
     pub async fn terminate(self, config: Arc<ServerConfig>) -> Result<TlsStream<TcpStream>> {
         StartHandshake::from_parts(self.accepted, self.stream)
             .into_stream(config)
             .await
-            .context("could not complete the API TLS handshake")
+            .context("could not complete the TLS handshake")
     }
 
     pub fn into_raw_parts(self) -> (Vec<u8>, TcpStream) {
@@ -44,7 +87,7 @@ impl TlsConnection {
     }
 }
 
-pub async fn inspect(mut stream: TcpStream) -> Result<Inspection> {
+pub async fn inspect(mut stream: TcpStream) -> Result<Option<TlsConnection>> {
     let mut first_byte = [0];
     stream
         .read_exact(&mut first_byte)
@@ -52,10 +95,8 @@ pub async fn inspect(mut stream: TcpStream) -> Result<Inspection> {
         .context("could not read the connection preface")?;
 
     if first_byte[0] != 22 {
-        return Ok(Inspection::Plain(PrefixedStream::new(
-            first_byte.to_vec(),
-            stream,
-        )));
+        stream.shutdown().await?;
+        return Ok(None);
     }
 
     let mut acceptor = Acceptor::default();
@@ -72,7 +113,7 @@ pub async fn inspect(mut stream: TcpStream) -> Result<Inspection> {
                 .client_hello()
                 .server_name()
                 .map(|name| name.trim_end_matches('.').to_ascii_lowercase());
-            return Ok(Inspection::Tls(TlsConnection {
+            return Ok(Some(TlsConnection {
                 accepted,
                 server_name,
                 prefix,
@@ -106,60 +147,4 @@ fn feed_acceptor(acceptor: &mut Acceptor, bytes: &[u8]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub struct PrefixedStream {
-    prefix: Vec<u8>,
-    prefix_offset: usize,
-    stream: TcpStream,
-}
-
-impl PrefixedStream {
-    fn new(prefix: Vec<u8>, stream: TcpStream) -> Self {
-        Self {
-            prefix,
-            prefix_offset: 0,
-            stream,
-        }
-    }
-}
-
-impl AsyncRead for PrefixedStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if this.prefix_offset < this.prefix.len() {
-            let remaining = &this.prefix[this.prefix_offset..];
-            let length = remaining.len().min(buffer.remaining());
-            buffer.put_slice(&remaining[..length]);
-            this.prefix_offset += length;
-            return Poll::Ready(Ok(()));
-        }
-
-        Pin::new(&mut this.stream).poll_read(context, buffer)
-    }
-}
-
-impl AsyncWrite for PrefixedStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(context, buffer)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.get_mut().stream).poll_flush(context)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
-    }
 }
