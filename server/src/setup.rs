@@ -1,10 +1,19 @@
 use std::{
+    fs,
     io::{self, Write},
     net::IpAddr,
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Config<'a> {
+    domain: &'a str,
+    public_ip: IpAddr,
+    listen_port: u16,
+}
 
 fn prompt(message: &str) -> Result<String> {
     print!("{message}");
@@ -104,6 +113,24 @@ pub fn run() -> Result<()> {
     println!(
         "Make sure DNS proxying is disabled. If a proxy terminates TLS, the tunnel will not be end-to-end encrypted."
     );
+
+    let config_dir = dirs::home_dir()
+        .context("could not determine the home directory")?
+        .join(".tunnel-server");
+    fs::create_dir_all(&config_dir)
+        .with_context(|| format!("could not create config directory {}", config_dir.display()))?;
+
+    let config_path = config_dir.join("config.json");
+    let config = Config {
+        domain: &tunnel_domain,
+        public_ip,
+        listen_port: 443,
+    };
+    let json = serde_json::to_string_pretty(&config).context("could not serialize config")?;
+    fs::write(&config_path, format!("{json}\n"))
+        .with_context(|| format!("could not write config to {}", config_path.display()))?;
+
+    println!("Configuration saved to {}", config_path.display());
 
     Ok(())
 }
