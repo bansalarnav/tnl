@@ -4,13 +4,15 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use rand::{Rng, distributions::Alphanumeric};
-use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::ServerName};
+use rustls_acme::{AcmeConfig, EventOk, caches::DirCache, is_tls_alpn_challenge};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
     net::TcpStream,
 };
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio_rustls::{LazyConfigAcceptor, TlsConnector, client::TlsStream};
+use tokio_stream::StreamExt;
 use url::{Host, Url};
 
 const LOGIN_BLOB_PREFIX: &str = "tunnel-login-v1.";
@@ -52,6 +54,12 @@ struct Config {
 enum ControlMessage {
     Ready { url: String },
     Connection { id: String },
+}
+
+#[derive(Clone)]
+struct EndpointTls {
+    regular: Arc<ServerConfig>,
+    challenge: Arc<ServerConfig>,
 }
 
 #[tokio::main]
@@ -124,16 +132,26 @@ async fn expose(port: u16, name: Option<String>) -> Result<()> {
 
     let control_stream = open_tunnel_connection(&config, &tunnel_id).await?;
     let mut messages = BufReader::new(control_stream).lines();
+    let mut endpoint_tls = None;
 
     while let Some(line) = messages.next_line().await? {
         match serde_json::from_str::<ControlMessage>(&line).context("invalid server message")? {
             ControlMessage::Ready { url } => {
-                println!("Forwarding {url} to 127.0.0.1:{port}");
+                let hostname = Url::parse(&url)
+                    .context("server returned an invalid tunnel URL")?
+                    .host_str()
+                    .context("server tunnel URL did not contain a hostname")?
+                    .to_owned();
+                println!("Obtaining a TLS certificate for {hostname}...");
+                endpoint_tls = Some(start_endpoint_tls(hostname, url, port)?);
             }
             ControlMessage::Connection { id } => {
+                let endpoint_tls = endpoint_tls
+                    .clone()
+                    .context("server sent a connection before the tunnel was ready")?;
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
-                    if let Err(error) = forward_connection(&config, port, &id).await {
+                    if let Err(error) = forward_connection(&config, endpoint_tls, port, &id).await {
                         eprintln!("connection {id} failed: {error:#}");
                     }
                 });
@@ -144,17 +162,82 @@ async fn expose(port: u16, name: Option<String>) -> Result<()> {
     bail!("tunnel server closed the control connection")
 }
 
-async fn forward_connection(config: &Config, port: u16, connection_id: &str) -> Result<()> {
-    let mut tunnel_stream =
+async fn forward_connection(
+    config: &Config,
+    endpoint_tls: EndpointTls,
+    port: u16,
+    connection_id: &str,
+) -> Result<()> {
+    let tunnel_stream =
         open_api_connection(config, &format!("/v1/connections/{connection_id}")).await?;
+    let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tunnel_stream)
+        .await
+        .context("could not read the visitor TLS ClientHello")?;
+    let is_challenge = is_tls_alpn_challenge(&handshake.client_hello());
+    let tls_config = if is_challenge {
+        endpoint_tls.challenge
+    } else {
+        endpoint_tls.regular
+    };
+    let mut visitor_stream = handshake
+        .into_stream(tls_config)
+        .await
+        .context("could not complete visitor TLS handshake")?;
+
+    if is_challenge {
+        visitor_stream.shutdown().await?;
+        return Ok(());
+    }
+
     let mut local_stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .with_context(|| format!("could not connect to 127.0.0.1:{port}"))?;
 
-    copy_bidirectional(&mut tunnel_stream, &mut local_stream)
+    copy_bidirectional(&mut visitor_stream, &mut local_stream)
         .await
         .context("could not forward tunnel connection")?;
     Ok(())
+}
+
+fn start_endpoint_tls(hostname: String, url: String, port: u16) -> Result<EndpointTls> {
+    let cache_directory = config_path()?
+        .parent()
+        .context("client config path does not have a parent directory")?
+        .join("acme");
+    fs::create_dir_all(&cache_directory).with_context(|| {
+        format!(
+            "could not create TLS cache directory {}",
+            cache_directory.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cache_directory, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let mut state = AcmeConfig::new([hostname.clone()])
+        .cache(DirCache::new(cache_directory))
+        .directory_lets_encrypt(true)
+        .state();
+    let endpoint_tls = EndpointTls {
+        regular: state.default_rustls_config(),
+        challenge: state.challenge_rustls_config(),
+    };
+
+    tokio::spawn(async move {
+        while let Some(event) = state.next().await {
+            match event {
+                Ok(EventOk::DeployedCachedCert | EventOk::DeployedNewCert) => {
+                    println!("Forwarding {url} to http://127.0.0.1:{port}");
+                }
+                Ok(EventOk::CertCacheStore | EventOk::AccountCacheStore) => {}
+                Err(error) => eprintln!("TLS certificate error for {hostname}: {error}"),
+            }
+        }
+    });
+
+    Ok(endpoint_tls)
 }
 
 async fn open_tunnel_connection(config: &Config, tunnel_id: &str) -> Result<TlsStream<TcpStream>> {

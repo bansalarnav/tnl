@@ -389,10 +389,12 @@ dependencies = [
  "dirs",
  "rand",
  "rustls",
+ "rustls-acme",
  "serde",
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "url",
  "webpki-roots 1.0.9",
 ]

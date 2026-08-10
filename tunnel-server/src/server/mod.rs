@@ -26,7 +26,7 @@ struct ServerState {
     api_tls_config: Arc<ServerConfig>,
     acme_tls_config: Arc<ServerConfig>,
     api_router: Router,
-    tunnels: tunnel::Registry,
+    tunnels: tunnel::TunnelRegistry,
 }
 
 fn state_directory() -> Result<PathBuf> {
@@ -149,7 +149,7 @@ pub async fn start(background: bool) -> Result<()> {
     let domain = config.domain.trim_end_matches('.').to_ascii_lowercase();
     let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
 
-    let tunnels = tunnel::Registry::new(domain.clone());
+    let tunnels = tunnel::TunnelRegistry::new(domain.clone());
     let state = Arc::new(ServerState {
         wildcard_suffix: format!(".{domain}"),
         domain,

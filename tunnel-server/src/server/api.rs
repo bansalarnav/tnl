@@ -12,14 +12,14 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
-use super::tunnel::Registry;
+use super::tunnel::TunnelRegistry;
 
 #[derive(Clone)]
 struct AuthenticatedClient {
     name: String,
 }
 
-pub fn router(tunnels: Registry) -> Router {
+pub fn router(tunnels: TunnelRegistry) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/tunnels/{tunnel_id}", connect(open_tunnel))
@@ -58,7 +58,7 @@ async fn authenticate(mut request: Request, next: Next) -> Response {
 }
 
 async fn open_tunnel(
-    State(tunnels): State<Registry>,
+    State(tunnels): State<TunnelRegistry>,
     Extension(client): Extension<AuthenticatedClient>,
     Path(tunnel_id): Path<String>,
     mut request: Request<Body>,
@@ -93,7 +93,7 @@ async fn open_tunnel(
 }
 
 async fn open_connection(
-    State(tunnels): State<Registry>,
+    State(tunnels): State<TunnelRegistry>,
     Extension(client): Extension<AuthenticatedClient>,
     Path(connection_id): Path<String>,
     mut request: Request<Body>,
