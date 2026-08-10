@@ -8,6 +8,14 @@ pub struct Config {
     pub domain: String,
     pub public_ip: IpAddr,
     pub listen_port: u16,
+    #[serde(default)]
+    pub clients: Vec<Client>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Client {
+    pub name: String,
+    pub token_hash: String,
 }
 
 impl Config {

@@ -1,4 +1,5 @@
 pub mod config;
+mod invite_client;
 mod server;
 mod setup;
 
@@ -20,6 +21,9 @@ enum Command {
         background: bool,
     },
     Stop,
+    InviteClient {
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -30,5 +34,6 @@ async fn main() -> Result<()> {
         Command::Setup => setup::run(),
         Command::Start { background } => server::start(background).await,
         Command::Stop => server::stop(),
+        Command::InviteClient { name } => invite_client::run(&name),
     }
 }

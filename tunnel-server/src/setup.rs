@@ -131,6 +131,7 @@ pub fn run() -> Result<()> {
         domain: tunnel_domain,
         public_ip,
         listen_port,
+        clients: Vec::new(),
     };
     config.write()?;
 
