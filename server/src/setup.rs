@@ -68,6 +68,16 @@ pub fn run() -> Result<()> {
         }
     };
 
+    let listen_port = loop {
+        let value = prompt("Listen port [443]: ")?;
+        let value = if value.is_empty() { "443" } else { &value };
+
+        match value.parse::<u16>() {
+            Ok(port) if port != 0 => break port,
+            _ => println!("Please enter a port between 1 and 65535."),
+        }
+    };
+
     let uses_nip_io = domain == "nip.io";
     let tunnel_domain = if uses_nip_io {
         format!("tunnel-{}.nip.io", public_ip.to_string().replace('.', "-"))
@@ -75,12 +85,17 @@ pub fn run() -> Result<()> {
         domain
     };
     let listen_address = if public_ip.is_ipv4() {
-        "0.0.0.0:443"
+        format!("0.0.0.0:{listen_port}")
     } else {
-        "[::]:443"
+        format!("[::]:{listen_port}")
+    };
+    let port_suffix = if listen_port == 443 {
+        String::new()
+    } else {
+        format!(":{listen_port}")
     };
 
-    println!("\nBrowser URL: https://<tunnel-id>.{tunnel_domain}");
+    println!("\nBrowser URL: https://<tunnel-id>.{tunnel_domain}{port_suffix}");
     println!("Listen address: {listen_address}");
 
     if uses_nip_io {
@@ -98,7 +113,7 @@ pub fn run() -> Result<()> {
         println!("Value: {tunnel_domain}");
     }
 
-    println!("\nMake sure the server is accessible from the internet on TCP port 443.");
+    println!("\nMake sure the server is accessible from the internet on TCP port {listen_port}.");
     println!(
         "Make sure DNS proxying is disabled. If a proxy terminates TLS, the tunnel will not be end-to-end encrypted."
     );
@@ -106,7 +121,7 @@ pub fn run() -> Result<()> {
     let config = Config {
         domain: tunnel_domain,
         public_ip,
-        listen_port: 443,
+        listen_port,
     };
     config.write()?;
 
