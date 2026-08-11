@@ -1,10 +1,9 @@
-use std::{error::Error, fmt, io, sync::Arc, time::Duration};
+use std::{error::Error, fmt, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use rand::{Rng, distributions::Alphanumeric};
+use rand::Rng;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::ServerName};
 use rustls_acme::{AcmeConfig, EventError, EventOk, caches::DirCache, is_tls_alpn_challenge};
-use serde::Deserialize;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
@@ -16,7 +15,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsConnector, client::TlsStream};
 use tokio_stream::StreamExt;
 use url::{Host, Url};
 
-use crate::config::{self, Config};
+use crate::{TunnelId, protocol::ServerControlMessage};
 
 const MAX_HTTP_RESPONSE_HEADER_LENGTH: usize = 16 * 1024;
 const ACME_ORDER_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
@@ -29,12 +28,81 @@ const RECONNECT_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 const RECONNECT_JITTER_MAX_MILLIS: u64 = 250;
 const PONG_MESSAGE: &[u8] = b"{\"type\":\"pong\"}\n";
 
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ControlMessage {
-    Ready { url: String },
-    Connection { id: String },
-    Ping,
+#[derive(Clone, Debug)]
+pub enum ClientEvent {
+    ObtainingCertificate {
+        hostname: String,
+    },
+    Ready {
+        url: String,
+        target: SocketAddr,
+    },
+    Reconnected {
+        url: String,
+    },
+    Disconnected {
+        error: String,
+        retry_in: Duration,
+    },
+    ConnectionFailed {
+        connection_id: String,
+        error: String,
+    },
+    CertificateError {
+        hostname: String,
+        error: String,
+        retry_in: Option<Duration>,
+    },
+}
+
+type EventHandler = Arc<dyn Fn(ClientEvent) + Send + Sync>;
+
+#[derive(Clone)]
+pub struct Client {
+    api_url: Url,
+    authorization: Option<Arc<str>>,
+    cache_directory: PathBuf,
+    event_handler: EventHandler,
+}
+
+impl Client {
+    pub fn new(api_url: Url, cache_directory: PathBuf) -> Result<Self> {
+        if api_url.scheme() != "https" || api_url.host().is_none() {
+            bail!("API URL must be an HTTPS URL with a host");
+        }
+
+        Ok(Self {
+            api_url,
+            authorization: None,
+            cache_directory,
+            event_handler: Arc::new(|_| {}),
+        })
+    }
+
+    pub fn with_authorization(mut self, authorization: impl Into<Arc<str>>) -> Result<Self> {
+        let authorization = authorization.into();
+        if authorization.is_empty() || authorization.chars().any(char::is_control) {
+            bail!("authorization must not be empty or contain control characters");
+        }
+        self.authorization = Some(authorization);
+        Ok(self)
+    }
+
+    pub fn with_event_handler(
+        mut self,
+        handler: impl Fn(ClientEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.event_handler = Arc::new(handler);
+        self
+    }
+
+    pub async fn expose(&self, target: SocketAddr, tunnel_id: TunnelId) -> Result<()> {
+        expose(Arc::new(self.clone()), target, tunnel_id).await
+    }
+
+    fn emit(&self, event: ClientEvent) {
+        (self.event_handler)(event);
+    }
 }
 
 #[derive(Clone)]
@@ -63,21 +131,7 @@ impl fmt::Display for ApiRejection {
 
 impl Error for ApiRejection {}
 
-pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
-    if port == 0 {
-        bail!("port must be between 1 and 65535");
-    }
-
-    let config = Arc::new(config::read()?);
-    let tunnel_id = match name {
-        Some(name) => {
-            let name = name.to_ascii_lowercase();
-            validate_tunnel_id(&name)?;
-            name
-        }
-        None => default_tunnel_id()?,
-    };
-
+async fn expose(client: Arc<Client>, target: SocketAddr, tunnel_id: TunnelId) -> Result<()> {
     let mut endpoint_tls = None;
     let mut has_registered = false;
     let mut reconnect_delay = RECONNECT_INITIAL_DELAY;
@@ -85,9 +139,9 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
     loop {
         let session_started = Instant::now();
         let result = run_control_session(
-            Arc::clone(&config),
-            &tunnel_id,
-            port,
+            Arc::clone(&client),
+            tunnel_id.as_str(),
+            target,
             &mut endpoint_tls,
             &mut has_registered,
         )
@@ -103,30 +157,33 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
         }
         let jitter =
             Duration::from_millis(rand::thread_rng().r#gen_range(0..=RECONNECT_JITTER_MAX_MILLIS));
-        eprintln!(
-            "Tunnel connection lost: {error:#}\nReconnecting in {:.1}s...",
-            (reconnect_delay + jitter).as_secs_f32()
-        );
-        tokio::time::sleep(reconnect_delay + jitter).await;
+        let retry_in = reconnect_delay + jitter;
+        client.emit(ClientEvent::Disconnected {
+            error: format!("{error:#}"),
+            retry_in,
+        });
+        tokio::time::sleep(retry_in).await;
         reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX_DELAY);
     }
 }
 
 async fn run_control_session(
-    config: Arc<Config>,
+    client: Arc<Client>,
     tunnel_id: &str,
-    port: u16,
+    target: SocketAddr,
     endpoint_tls: &mut Option<EndpointTls>,
     has_registered: &mut bool,
 ) -> Result<()> {
-    let control_stream = open_tunnel_connection(&config, tunnel_id).await?;
+    let control_stream = open_tunnel_connection(&client, tunnel_id).await?;
     *has_registered = true;
     let (reader, mut writer) = tokio::io::split(control_stream);
     let mut messages = BufReader::new(reader).lines();
 
     while let Some(line) = messages.next_line().await? {
-        match serde_json::from_str::<ControlMessage>(&line).context("invalid server message")? {
-            ControlMessage::Ready { url } => {
+        match serde_json::from_str::<ServerControlMessage>(&line)
+            .context("invalid server message")?
+        {
+            ServerControlMessage::Ready { url } => {
                 let hostname = Url::parse(&url)
                     .context("server returned an invalid tunnel URL")?
                     .host_str()
@@ -140,26 +197,31 @@ async fn run_control_session(
                             endpoint_tls.hostname
                         );
                     }
-                    println!("Reconnected {url}");
+                    client.emit(ClientEvent::Reconnected { url });
                 } else {
-                    println!("Obtaining a TLS certificate for {hostname}...");
-                    *endpoint_tls = Some(start_endpoint_tls(hostname, url, port)?);
+                    client.emit(ClientEvent::ObtainingCertificate {
+                        hostname: hostname.clone(),
+                    });
+                    *endpoint_tls = Some(start_endpoint_tls(&client, hostname, url, target)?);
                 }
             }
-            ControlMessage::Connection { id } => {
+            ServerControlMessage::Connection { id } => {
                 let endpoint_tls = endpoint_tls
                     .clone()
                     .context("server sent a connection before the tunnel was ready")?;
-                let config = Arc::clone(&config);
+                let client = Arc::clone(&client);
                 tokio::spawn(async move {
-                    if let Err(error) = forward_connection(&config, endpoint_tls, port, &id).await
+                    if let Err(error) = forward_connection(&client, endpoint_tls, target, &id).await
                         && !is_routine_connection_error(&error)
                     {
-                        eprintln!("connection {id} failed: {error:#}");
+                        client.emit(ClientEvent::ConnectionFailed {
+                            connection_id: id,
+                            error: format!("{error:#}"),
+                        });
                     }
                 });
             }
-            ControlMessage::Ping => writer
+            ServerControlMessage::Ping => writer
                 .write_all(PONG_MESSAGE)
                 .await
                 .context("could not answer tunnel heartbeat")?,
@@ -170,13 +232,13 @@ async fn run_control_session(
 }
 
 async fn forward_connection(
-    config: &Config,
+    client: &Client,
     mut endpoint_tls: EndpointTls,
-    port: u16,
+    target: SocketAddr,
     connection_id: &str,
 ) -> Result<()> {
     let tunnel_stream =
-        open_api_connection(config, &format!("/v1/connections/{connection_id}")).await?;
+        open_api_connection(client, &format!("/v1/connections/{connection_id}")).await?;
     let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tunnel_stream)
         .await
         .context("could not read the visitor TLS ClientHello")?;
@@ -208,9 +270,9 @@ async fn forward_connection(
         return Ok(());
     }
 
-    let mut local_stream = TcpStream::connect(("127.0.0.1", port))
+    let mut local_stream = TcpStream::connect(target)
         .await
-        .with_context(|| format!("could not connect to 127.0.0.1:{port}"))?;
+        .with_context(|| format!("could not connect to {target}"))?;
 
     copy_bidirectional(&mut visitor_stream, &mut local_stream)
         .await
@@ -245,11 +307,13 @@ fn is_routine_connection_error(error: &anyhow::Error) -> bool {
     })
 }
 
-fn start_endpoint_tls(hostname: String, url: String, port: u16) -> Result<EndpointTls> {
-    let cache_directory = config::path()?
-        .parent()
-        .context("tnl config path does not have a parent directory")?
-        .join("acme");
+fn start_endpoint_tls(
+    client: &Arc<Client>,
+    hostname: String,
+    url: String,
+    target: SocketAddr,
+) -> Result<EndpointTls> {
+    let cache_directory = client.cache_directory.clone();
     std::fs::create_dir_all(&cache_directory).with_context(|| {
         format!(
             "could not create TLS cache directory {}",
@@ -274,19 +338,28 @@ fn start_endpoint_tls(hostname: String, url: String, port: u16) -> Result<Endpoi
         certificate_ready: certificate_status,
     };
 
+    let client = Arc::clone(client);
     tokio::spawn(async move {
         while let Some(event) = state.next().await {
             match event {
                 Ok(EventOk::DeployedCachedCert | EventOk::DeployedNewCert) => {
                     certificate_ready.send_replace(true);
-                    println!("Forwarding {url} to http://127.0.0.1:{port}");
+                    client.emit(ClientEvent::Ready {
+                        url: url.clone(),
+                        target,
+                    });
                 }
                 Ok(EventOk::CertCacheStore | EventOk::AccountCacheStore) => {}
                 Err(error) => {
-                    eprintln!("TLS certificate error for {hostname}: {error}");
-                    if matches!(error, EventError::Order(_)) {
-                        eprintln!("Retrying certificate order for {hostname} in 1 hour");
-                        tokio::time::sleep(ACME_ORDER_RETRY_DELAY).await;
+                    let retry_in =
+                        matches!(error, EventError::Order(_)).then_some(ACME_ORDER_RETRY_DELAY);
+                    client.emit(ClientEvent::CertificateError {
+                        hostname: hostname.clone(),
+                        error: error.to_string(),
+                        retry_in,
+                    });
+                    if let Some(delay) = retry_in {
+                        tokio::time::sleep(delay).await;
                     }
                 }
             }
@@ -296,27 +369,20 @@ fn start_endpoint_tls(hostname: String, url: String, port: u16) -> Result<Endpoi
     Ok(endpoint_tls)
 }
 
-async fn open_tunnel_connection(config: &Config, tunnel_id: &str) -> Result<TlsStream<TcpStream>> {
-    open_api_connection(config, &format!("/v1/tunnels/{tunnel_id}"))
+async fn open_tunnel_connection(client: &Client, tunnel_id: &str) -> Result<TlsStream<TcpStream>> {
+    open_api_connection(client, &format!("/v1/tunnels/{tunnel_id}"))
         .await
         .with_context(|| format!("could not register tunnel {tunnel_id}"))
 }
 
-async fn open_api_connection(config: &Config, path: &str) -> Result<TlsStream<TcpStream>> {
-    let api_url = Url::parse(&config.api_url).context("config contains an invalid API URL")?;
-    if api_url.scheme() != "https" {
-        bail!("config API URL must use HTTPS");
-    }
-    if config.token.is_empty() || config.token.chars().any(char::is_control) {
-        bail!("config contains an invalid token");
-    }
-
+async fn open_api_connection(client: &Client, path: &str) -> Result<TlsStream<TcpStream>> {
+    let api_url = &client.api_url;
     let host = api_url
         .host_str()
-        .context("config API URL does not contain a host")?;
+        .context("API URL does not contain a host")?;
     let port = api_url
         .port_or_known_default()
-        .context("config API URL does not contain a port")?;
+        .context("API URL does not contain a port")?;
     let tcp_stream = TcpStream::connect((host, port))
         .await
         .with_context(|| format!("could not connect to {host}:{port}"))?;
@@ -337,10 +403,12 @@ async fn open_api_connection(config: &Config, path: &str) -> Result<TlsStream<Tc
         Host::Ipv6(address) => format!("[{address}]:{port}"),
         _ => format!("{host}:{port}"),
     };
-    let request = format!(
-        "CONNECT {path} HTTP/1.1\r\nHost: {host_header}\r\nAuthorization: Bearer {}\r\n\r\n",
-        config.token
-    );
+    let authorization = client
+        .authorization
+        .as_deref()
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    let request = format!("CONNECT {path} HTTP/1.1\r\nHost: {host_header}\r\n{authorization}\r\n");
     stream.write_all(request.as_bytes()).await?;
 
     let response_header = read_http_response_header(&mut stream).await?;
@@ -395,53 +463,4 @@ async fn read_http_response_header(stream: &mut TlsStream<TcpStream>) -> Result<
         header.push(byte[0]);
     }
     String::from_utf8(header).context("tunnel server returned a non-UTF-8 HTTP response")
-}
-
-fn default_tunnel_id() -> Result<String> {
-    let directory = std::env::current_dir().context("could not determine current directory")?;
-    let name = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(sanitize_tunnel_id)
-        .filter(|name| !name.is_empty());
-
-    Ok(name.unwrap_or_else(|| {
-        rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .filter(|byte| byte.is_ascii_alphanumeric())
-            .take(8)
-            .map(char::from)
-            .collect::<String>()
-            .to_ascii_lowercase()
-    }))
-}
-
-fn sanitize_tunnel_id(value: &str) -> String {
-    let mut result = String::new();
-    let mut previous_was_separator = false;
-    for character in value.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_lowercase() || character.is_ascii_digit() {
-            result.push(character);
-            previous_was_separator = false;
-        } else if !previous_was_separator && !result.is_empty() {
-            result.push('-');
-            previous_was_separator = true;
-        }
-    }
-    result.truncate(63);
-    result.trim_end_matches('-').to_owned()
-}
-
-fn validate_tunnel_id(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 63
-        || value.starts_with('-')
-        || value.ends_with('-')
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
-        bail!("tunnel name must contain only lowercase letters, numbers, and internal hyphens");
-    }
-    Ok(())
 }

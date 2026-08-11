@@ -5,7 +5,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(version, about = "Expose local HTTP services through your tnld server")]
+#[command(
+    version,
+    about = "Expose local HTTP services through your tnld server with tnlc"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
