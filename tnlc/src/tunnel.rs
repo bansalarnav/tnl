@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rand::{Rng, distributions::Alphanumeric};
 use tnl::{
     TunnelId,
@@ -11,6 +11,10 @@ use url::Url;
 use crate::config;
 
 pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
+    if port == 0 {
+        bail!("port must be between 1 and 65535");
+    }
+
     let config = config::read()?;
     let tunnel_id = match name {
         Some(name) => TunnelId::new(name.to_ascii_lowercase())?,

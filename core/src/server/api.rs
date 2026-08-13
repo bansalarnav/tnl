@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::TunnelId;
 
-use super::{ClientIdentity, EventHandler, ServerEvent, TunnelRegistry};
+use super::{ClientIdentity, EventHandler, ServerEvent, ShutdownSignal, TunnelRegistry};
 
 pub fn router(tunnels: TunnelRegistry, events: EventHandler) -> Router {
     Router::new()
@@ -29,6 +29,7 @@ struct ApiState {
 async fn open_tunnel(
     State(state): State<ApiState>,
     Extension(client): Extension<ClientIdentity>,
+    shutdown: Option<Extension<ShutdownSignal>>,
     Path(tunnel_id): Path<String>,
     mut request: Request<Body>,
 ) -> Response {
@@ -42,20 +43,27 @@ async fn open_tunnel(
 
     let on_upgrade = hyper::upgrade::on(&mut request);
     tokio::spawn(async move {
-        let result = async {
+        let serve = async {
             let upgraded = on_upgrade.await?;
             state
                 .tunnels
                 .serve_control(tunnel_id.clone(), registration.receiver, upgraded)
                 .await
-        }
-        .await;
+        };
+
+        let result = match shutdown {
+            Some(Extension(mut shutdown)) => tokio::select! {
+                result = serve => Some(result),
+                _ = shutdown.0.changed() => None,
+            },
+            None => Some(serve.await),
+        };
 
         state
             .tunnels
             .unregister(&tunnel_id, registration.session_id)
             .await;
-        if let Err(error) = result {
+        if let Some(Err(error)) = result {
             (state.events)(ServerEvent::TunnelDisconnected {
                 tunnel_id,
                 error: format!("{error:#}"),
@@ -69,6 +77,7 @@ async fn open_tunnel(
 async fn open_connection(
     State(state): State<ApiState>,
     Extension(client): Extension<ClientIdentity>,
+    shutdown: Option<Extension<ShutdownSignal>>,
     Path(connection_id): Path<String>,
     mut request: Request<Body>,
 ) -> Response {
@@ -78,13 +87,23 @@ async fn open_connection(
 
     let on_upgrade = hyper::upgrade::on(&mut request);
     tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
-                let _ = sender.send(hyper_util::rt::TokioIo::new(upgraded));
+        let upgrade = async {
+            match on_upgrade.await {
+                Ok(upgraded) => {
+                    let _ = sender.send(hyper_util::rt::TokioIo::new(upgraded));
+                }
+                Err(error) => (state.events)(ServerEvent::DataConnectionUpgradeFailed {
+                    error: error.to_string(),
+                }),
             }
-            Err(error) => (state.events)(ServerEvent::DataConnectionUpgradeFailed {
-                error: error.to_string(),
-            }),
+        };
+
+        match shutdown {
+            Some(Extension(mut shutdown)) => tokio::select! {
+                _ = upgrade => {}
+                _ = shutdown.0.changed() => {}
+            },
+            None => upgrade.await,
         }
     });
 

@@ -9,6 +9,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
     net::TcpStream,
     sync::watch,
+    task::JoinSet,
     time::Instant,
 };
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector, client::TlsStream};
@@ -97,6 +98,9 @@ impl Client {
     }
 
     pub async fn expose(&self, target: SocketAddr, tunnel_id: TunnelId) -> Result<()> {
+        if target.port() == 0 {
+            bail!("target port must be between 1 and 65535");
+        }
         expose(Arc::new(self.clone()), target, tunnel_id).await
     }
 
@@ -135,6 +139,7 @@ async fn expose(client: Arc<Client>, target: SocketAddr, tunnel_id: TunnelId) ->
     let mut endpoint_tls = None;
     let mut has_registered = false;
     let mut reconnect_delay = RECONNECT_INITIAL_DELAY;
+    let mut background_tasks = JoinSet::new();
 
     loop {
         let session_started = Instant::now();
@@ -144,6 +149,7 @@ async fn expose(client: Arc<Client>, target: SocketAddr, tunnel_id: TunnelId) ->
             target,
             &mut endpoint_tls,
             &mut has_registered,
+            &mut background_tasks,
         )
         .await;
 
@@ -173,6 +179,7 @@ async fn run_control_session(
     target: SocketAddr,
     endpoint_tls: &mut Option<EndpointTls>,
     has_registered: &mut bool,
+    background_tasks: &mut JoinSet<()>,
 ) -> Result<()> {
     let control_stream = open_tunnel_connection(&client, tunnel_id).await?;
     *has_registered = true;
@@ -202,7 +209,13 @@ async fn run_control_session(
                     client.emit(ClientEvent::ObtainingCertificate {
                         hostname: hostname.clone(),
                     });
-                    *endpoint_tls = Some(start_endpoint_tls(&client, hostname, url, target)?);
+                    *endpoint_tls = Some(start_endpoint_tls(
+                        &client,
+                        hostname,
+                        url,
+                        target,
+                        background_tasks,
+                    )?);
                 }
             }
             ServerControlMessage::Connection { id } => {
@@ -210,7 +223,8 @@ async fn run_control_session(
                     .clone()
                     .context("server sent a connection before the tunnel was ready")?;
                 let client = Arc::clone(&client);
-                tokio::spawn(async move {
+                while background_tasks.try_join_next().is_some() {}
+                background_tasks.spawn(async move {
                     if let Err(error) = forward_connection(&client, endpoint_tls, target, &id).await
                         && !is_routine_connection_error(&error)
                     {
@@ -312,6 +326,7 @@ fn start_endpoint_tls(
     hostname: String,
     url: String,
     target: SocketAddr,
+    background_tasks: &mut JoinSet<()>,
 ) -> Result<EndpointTls> {
     let cache_directory = client.cache_directory.clone();
     std::fs::create_dir_all(&cache_directory).with_context(|| {
@@ -339,7 +354,7 @@ fn start_endpoint_tls(
     };
 
     let client = Arc::clone(client);
-    tokio::spawn(async move {
+    background_tasks.spawn(async move {
         while let Some(event) = state.next().await {
             match event {
                 Ok(EventOk::DeployedCachedCert | EventOk::DeployedNewCert) => {
