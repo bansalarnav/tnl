@@ -17,8 +17,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
-use hyper::upgrade::Upgraded;
-use hyper_util::rt::TokioIo;
 use rustls::ServerConfig;
 use socket2::{SockRef, TcpKeepalive};
 use tnl::{TunnelId, server::Broker};
@@ -30,8 +28,6 @@ use tokio::{
 
 use crate::config::Config;
 
-pub type DataStream = TokioIo<Upgraded>;
-
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
@@ -42,7 +38,7 @@ struct ServerState {
     api_tls_config: Arc<ServerConfig>,
     acme_tls_config: Arc<ServerConfig>,
     api_router: Router,
-    broker: Broker<DataStream>,
+    broker: Broker,
 }
 
 fn state_directory() -> Result<PathBuf> {
@@ -130,15 +126,14 @@ pub async fn start(background: bool) -> Result<()> {
     let domain = config.domain.trim_end_matches('.').to_ascii_lowercase();
     let wildcard_suffix = format!(".{domain}");
     let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
-    let public_domain = domain.clone();
-    let broker =
-        Broker::with_ready_value(move |tunnel_id| format!("https://{tunnel_id}.{public_domain}"));
+    let broker = Broker::new();
+    let api_router = api::router(broker.clone(), domain.clone());
     let state = Arc::new(ServerState {
         wildcard_suffix,
         domain,
         api_tls_config: tls_configs.api,
         acme_tls_config: tls_configs.acme_challenge,
-        api_router: api::router(broker.clone()),
+        api_router,
         broker: broker.clone(),
     });
 
@@ -148,7 +143,7 @@ pub async fn start(background: bool) -> Result<()> {
         .with_context(|| format!("could not listen on {address}"))?;
     println!("Server listening on {address}");
 
-    struct ShutdownOnDrop(Broker<DataStream>);
+    struct ShutdownOnDrop(Broker);
     impl Drop for ShutdownOnDrop {
         fn drop(&mut self) {
             self.0.shutdown();

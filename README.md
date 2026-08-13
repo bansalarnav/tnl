@@ -67,7 +67,7 @@ cargo run --release -p tnld -- stop
 
 ## Core API
 
-`tnl-core` handles the control protocol, heartbeats, registration ownership, and connection pairing. It does not open sockets or depend on HTTP, TLS, Axum, Hyper, ACME, hostnames, or authentication policy.
+`tnl-core` multiplexes independent bidirectional streams over one application-provided connection using muxado. It does not open sockets or depend on HTTP, TLS, Axum, Hyper, ACME, hostnames, or authentication policy.
 
 Enable either or both sides:
 
@@ -77,69 +77,79 @@ tnl = { package = "tnl-core", path = "core", features = ["client", "server"] }
 
 ### Node side
 
-Pass an already-established Tokio `AsyncRead + AsyncWrite` control stream to `ClientSession`. How that stream is authenticated and transported is application-owned.
+Pass an already-established Tokio `AsyncRead + AsyncWrite` stream to `ClientSession`. How that connection is authenticated and transported is application-owned.
 
 ```rust,no_run
 use tnl::client::ClientSession;
 
 # async fn node<S>(control_stream: S) -> anyhow::Result<()>
-# where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
-let mut session = ClientSession::new(control_stream);
-let ready_value = session.wait_until_ready().await?;
-println!("registered as {ready_value}");
+# where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
+let session = ClientSession::new(control_stream);
+
+// Either endpoint can initiate a new independent stream.
+let outgoing = session.open("grpc").await?;
+tokio::spawn(async move {
+    drop(outgoing);
+});
 
 loop {
-    let request = session.accept().await?;
-    let connection_id = request.into_id();
+    let stream = session.accept().await?;
+    println!("incoming protocol: {:?}", stream.tag());
 
     tokio::spawn(async move {
-        // Ask the application transport to open its data stream for
-        // `connection_id`, then serve gRPC or another protocol over it.
-        let _ = connection_id;
+        // `stream` implements Tokio AsyncRead + AsyncWrite. Serve gRPC,
+        // a framed protocol, or arbitrary bidirectional traffic over it.
+        drop(stream);
     });
 }
 # }
 ```
 
-Keep accepting while individual connections run concurrently so the session continues answering heartbeats.
+Keep accepting while individual streams run concurrently. A background task drives the multiplexed connection, so cloned session handles may call `open` and `accept` concurrently.
 
 ### Central side
 
-`Broker<D>` is generic over the application’s data-stream type. The transport adapter registers authenticated control streams and attaches authenticated data streams; application code calls `connect` to initiate a connection to a node.
+The transport adapter registers each authenticated node with `Broker`, then runs its `ServerSession` over the established connection. Application code calls `connect` to open a new logical stream to that node; no additional socket or authentication round trip is needed.
 
 ```rust,no_run
 use tnl::{TunnelId, server::Broker};
 
-# async fn central<Control, Data>(control: Control, data: Data) -> anyhow::Result<()>
+# async fn central<Control>(control: Control) -> anyhow::Result<()>
 # where
 #     Control: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-#     Data: Send + 'static,
 # {
-let broker = Broker::<Data>::new();
+let broker = Broker::new();
 let node_id = TunnelId::new("node-42")?;
 
-// After authenticating the node's control transport:
-let registration = broker
-    .register(node_id.clone(), "authenticated-principal")
+// After authenticating the node's transport:
+let session = broker
+    .register(node_id.clone())
     .expect("node is already registered");
-tokio::spawn(registration.serve(control));
+tokio::spawn(session.clone().serve(control));
 
-// After authenticating a data transport and reading its connection ID:
-# let connection_id = "example";
-if let Some(attachment) = broker.claim(connection_id, "authenticated-principal") {
-    let _ = attachment.attach(data);
-}
+// Node-initiated streams are accepted from the same session handle.
+let incoming_session = session.clone();
+tokio::spawn(async move {
+    let incoming = incoming_session.accept().await?;
+    match incoming.tag() {
+        "grpc" => { /* serve gRPC over `incoming` */ }
+        "files" => { /* receive a file */ }
+        _ => { /* reject an unsupported protocol */ }
+    }
+    drop(incoming);
+    Ok::<_, tnl::ConnectionError>(())
+});
 
 // From central application code:
-if let Some(stream) = broker.connect(&node_id).await? {
-    // `stream` is the application's original `Data` type. It can carry
-    // bidirectional gRPC, a framed protocol, or arbitrary traffic.
+if let Some(stream) = broker.connect(&node_id, "grpc").await? {
+    // `stream` implements Tokio AsyncRead + AsyncWrite and is independent
+    // of every other logical stream in the same session.
     drop(stream);
 }
 # Ok(())
 # }
 ```
 
-Use `Broker::with_ready_value` when the node needs an application-defined value after registration. Call `Broker::shutdown` during graceful shutdown; registrations and pending connections are then closed and rejected.
+The node is unregistered when its session driver ends or its last `ServerSession` handle is dropped. Call `Broker::shutdown` during graceful shutdown to close all sessions and reject new registrations and streams.
 
 The HTTP `CONNECT` implementation used by the CLI is deliberately outside core in `tnlc` and `tnld`.

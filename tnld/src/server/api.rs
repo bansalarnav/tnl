@@ -1,8 +1,8 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Extension, Path, Request, State},
-    http::{StatusCode, header::AUTHORIZATION},
+    extract::{Path, Request, State},
+    http::{HeaderValue, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{connect, get},
@@ -14,21 +14,21 @@ use tnl::{TunnelId, server::Broker};
 
 use crate::config::Config;
 
-use super::DataStream;
-
 #[derive(Clone)]
-struct AuthenticatedClient(String);
+struct ApiState {
+    broker: Broker,
+    domain: String,
+}
 
-pub fn router(broker: Broker<DataStream>) -> Router {
+pub fn router(broker: Broker, domain: String) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/tunnels/{tunnel_id}", connect(open_tunnel))
-        .route("/v1/connections/{connection_id}", connect(open_connection))
         .route_layer(middleware::from_fn(authenticate))
-        .with_state(broker)
+        .with_state(ApiState { broker, domain })
 }
 
-async fn authenticate(mut request: Request, next: Next) -> Response {
+async fn authenticate(request: Request, next: Next) -> Response {
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -44,47 +44,50 @@ async fn authenticate(mut request: Request, next: Next) -> Response {
         Ok(config) => config,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let Some(client) = config
+    if !config
         .clients
         .iter()
-        .find(|client| client.token_hash == token_hash)
-    else {
+        .any(|client| client.token_hash == token_hash)
+    {
         return StatusCode::UNAUTHORIZED.into_response();
-    };
+    }
 
-    request
-        .extensions_mut()
-        .insert(AuthenticatedClient(client.name.clone()));
     next.run(request).await
 }
 
 async fn open_tunnel(
-    State(broker): State<Broker<DataStream>>,
-    Extension(client): Extension<AuthenticatedClient>,
+    State(state): State<ApiState>,
     Path(tunnel_id): Path<String>,
     mut request: Request<Body>,
 ) -> Response {
-    if broker.is_shutdown() {
+    if state.broker.is_shutdown() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
         return (StatusCode::BAD_REQUEST, "invalid tunnel name").into_response();
     };
-    let Some(registration) = broker.register(tunnel_id.clone(), client.0) else {
-        return if broker.is_shutdown() {
+    let Some(session) = state.broker.register(tunnel_id.clone()) else {
+        return if state.broker.is_shutdown() {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         } else {
             (StatusCode::CONFLICT, "tunnel name is already in use").into_response()
         };
     };
 
+    let url = format!("https://{tunnel_id}.{}", state.domain);
+    let Ok(url) = HeaderValue::from_str(&url) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     let on_upgrade = hyper::upgrade::on(&mut request);
-    let shutdown = broker.clone();
+    let shutdown = state.broker.clone();
     tokio::spawn(async move {
         let result = tokio::select! {
             result = async {
-                let upgraded = on_upgrade.await?;
-                registration.serve(TokioIo::new(upgraded)).await
+                let upgraded = on_upgrade.await.map_err(anyhow::Error::from)?;
+                session
+                    .serve(TokioIo::new(upgraded))
+                    .await
+                    .map_err(anyhow::Error::from)
             } => Some(result),
             _ = shutdown.wait_for_shutdown() => None,
         };
@@ -93,34 +96,7 @@ async fn open_tunnel(
         }
     });
 
-    StatusCode::OK.into_response()
-}
-
-async fn open_connection(
-    State(broker): State<Broker<DataStream>>,
-    Extension(client): Extension<AuthenticatedClient>,
-    Path(connection_id): Path<String>,
-    mut request: Request<Body>,
-) -> Response {
-    let Some(attachment) = broker.claim(&connection_id, &client.0) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    let on_upgrade = hyper::upgrade::on(&mut request);
-    let shutdown = broker.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            result = on_upgrade => match result {
-                Ok(upgraded) => {
-                    let _ = attachment.attach(TokioIo::new(upgraded));
-                }
-                Err(error) => eprintln!("data connection upgrade failed: {error}"),
-            },
-            _ = shutdown.wait_for_shutdown() => {}
-        }
-    });
-
-    StatusCode::OK.into_response()
+    (StatusCode::OK, [("X-Tnl-Url", url)]).into_response()
 }
 
 async fn health() -> Json<Value> {

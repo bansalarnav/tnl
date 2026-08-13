@@ -35,6 +35,7 @@ const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const RECONNECT_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 const RECONNECT_JITTER_MAX_MILLIS: u64 = 250;
+const TCP_FORWARD_TAG: &str = "tnl/tcp";
 
 type ApiStream = TlsStream<TcpStream>;
 
@@ -159,12 +160,12 @@ async fn run_control_session(
     background_tasks: &mut JoinSet<()>,
 ) -> Result<()> {
     let control_stream = transport
-        .open(&format!("/v1/tunnels/{tunnel_id}"))
+        .open_tunnel(tunnel_id)
         .await
         .with_context(|| format!("could not register tunnel {tunnel_id}"))?;
     *has_registered = true;
-    let mut session = ClientSession::new(control_stream);
-    let url = session.wait_until_ready().await?.to_owned();
+    let (control_stream, url) = control_stream;
+    let session = ClientSession::new(control_stream);
     let hostname = Url::parse(&url)
         .context("server returned an invalid tunnel URL")?
         .host_str()
@@ -191,33 +192,30 @@ async fn run_control_session(
     }
 
     loop {
-        let request = session.accept().await?;
-        let connection_id = request.into_id();
+        let tunnel_stream = session.accept().await?;
+        if tunnel_stream.tag() != TCP_FORWARD_TAG {
+            eprintln!("ignoring unsupported stream tag: {}", tunnel_stream.tag());
+            continue;
+        }
         let endpoint_tls = endpoint_tls
             .clone()
             .context("server sent a connection before the tunnel was ready")?;
-        let transport = Arc::clone(&transport);
         while background_tasks.try_join_next().is_some() {}
         background_tasks.spawn(async move {
-            if let Err(error) =
-                forward_connection(&transport, endpoint_tls, target, &connection_id).await
+            if let Err(error) = forward_connection(tunnel_stream, endpoint_tls, target).await
                 && !is_routine_connection_error(&error)
             {
-                eprintln!("connection {connection_id} failed: {error:#}");
+                eprintln!("tunnel connection failed: {error:#}");
             }
         });
     }
 }
 
 async fn forward_connection(
-    transport: &HttpTransport,
+    tunnel_stream: tnl::Stream,
     mut endpoint_tls: EndpointTls,
     target: SocketAddr,
-    connection_id: &str,
 ) -> Result<()> {
-    let tunnel_stream = transport
-        .open(&format!("/v1/connections/{connection_id}"))
-        .await?;
     let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tunnel_stream)
         .await
         .context("could not read the visitor TLS ClientHello")?;
@@ -312,7 +310,7 @@ fn start_endpoint_tls(
 }
 
 impl HttpTransport {
-    async fn open(&self, path: &str) -> Result<ApiStream> {
+    async fn open_tunnel(&self, tunnel_id: &TunnelId) -> Result<(ApiStream, String)> {
         let host = self
             .api_url
             .host_str()
@@ -337,8 +335,8 @@ impl HttpTransport {
             _ => format!("{host}:{port}"),
         };
         let request = format!(
-            "CONNECT {path} HTTP/1.1\r\nHost: {host_header}\r\nAuthorization: {}\r\n\r\n",
-            self.authorization
+            "CONNECT /v1/tunnels/{tunnel_id} HTTP/1.1\r\nHost: {host_header}\r\nAuthorization: {}\r\n\r\n",
+            self.authorization,
         );
         stream.write_all(request.as_bytes()).await?;
 
@@ -360,7 +358,15 @@ impl HttpTransport {
             .into());
         }
 
-        Ok(stream)
+        let url = response_header
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-tnl-url"))
+            .map(|(_, value)| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .context("tunnel server response did not include X-Tnl-Url")?;
+
+        Ok((stream, url))
     }
 }
 

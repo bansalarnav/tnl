@@ -1,92 +1,50 @@
-use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use std::sync::Arc;
 
-use crate::protocol::ServerControlMessage;
+use muxado::{Accept, MuxadoAccept, MuxadoOpen, OpenClose, Session, SessionBuilder};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::Mutex,
+};
 
-const PONG_MESSAGE: &[u8] = b"{\"type\":\"pong\"}\n";
+use crate::{ConnectionError, Stream};
 
-/// A registered node session over an application-provided control stream.
-pub struct ClientSession<S> {
-    stream: BufReader<S>,
-    ready_value: Option<String>,
+/// The node side of a multiplexed tunnel session.
+#[derive(Clone)]
+pub struct ClientSession {
+    opener: MuxadoOpen,
+    accepter: Arc<Mutex<MuxadoAccept>>,
 }
 
-impl<S> ClientSession<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    pub fn new(stream: S) -> Self {
+impl ClientSession {
+    /// Starts a session over an already-established transport stream.
+    pub fn new<S>(stream: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (opener, accepter) = SessionBuilder::new(stream).client().start().split();
         Self {
-            stream: BufReader::new(stream),
-            ready_value: None,
+            opener,
+            accepter: Arc::new(Mutex::new(accepter)),
         }
     }
 
-    /// Waits for registration to complete and returns the server-provided value.
-    pub async fn wait_until_ready(&mut self) -> Result<&str> {
-        if self.ready_value.is_none() {
-            loop {
-                match self.next_message().await? {
-                    ServerControlMessage::Ready { url } => {
-                        self.ready_value = Some(url);
-                        break;
-                    }
-                    ServerControlMessage::Connection { .. } => {
-                        bail!("server sent a connection before the session was ready");
-                    }
-                    ServerControlMessage::Ping => self.answer_heartbeat().await?,
-                }
-            }
-        }
-
-        Ok(self
-            .ready_value
-            .as_deref()
-            .expect("ready value was set above"))
+    /// Opens a new bidirectional stream to the central server.
+    pub async fn open(&self, tag: impl AsRef<str>) -> Result<Stream, ConnectionError> {
+        let tag = tag.as_ref().to_owned();
+        Stream::validate_tag(&tag)?;
+        let stream = self.opener.clone().open().await?;
+        Stream::outgoing(stream, tag).await
     }
 
-    /// Waits for the next connection requested by the central server.
-    pub async fn accept(&mut self) -> Result<ConnectionRequest> {
-        self.wait_until_ready().await?;
-        loop {
-            match self.next_message().await? {
-                ServerControlMessage::Ready { .. } => {
-                    bail!("server sent more than one ready message");
-                }
-                ServerControlMessage::Connection { id } => return Ok(ConnectionRequest { id }),
-                ServerControlMessage::Ping => self.answer_heartbeat().await?,
-            }
-        }
-    }
-
-    async fn next_message(&mut self) -> Result<ServerControlMessage> {
-        let mut line = String::new();
-        if self.stream.read_line(&mut line).await? == 0 {
-            bail!("server closed the control connection");
-        }
-        serde_json::from_str(&line).context("invalid server message")
-    }
-
-    async fn answer_heartbeat(&mut self) -> Result<()> {
-        self.stream
-            .get_mut()
-            .write_all(PONG_MESSAGE)
+    /// Waits for the central server to open the next bidirectional stream.
+    pub async fn accept(&self) -> Result<Stream, ConnectionError> {
+        let stream = self
+            .accepter
+            .lock()
             .await
-            .context("could not answer session heartbeat")
-    }
-}
-
-/// A central-initiated connection that the transport adapter should open.
-pub struct ConnectionRequest {
-    id: String,
-}
-
-impl ConnectionRequest {
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn into_id(self) -> String {
-        self.id
+            .accept()
+            .await
+            .ok_or(muxado::Error::SessionClosed)?;
+        Stream::incoming(stream).await
     }
 }

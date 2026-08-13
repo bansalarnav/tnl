@@ -1,8 +1,5 @@
 use std::{error::Error, fmt, str::FromStr};
 
-#[cfg(any(feature = "client", feature = "server"))]
-use serde::{Deserialize, Serialize};
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TunnelId(String);
 
@@ -61,22 +58,6 @@ impl fmt::Display for InvalidTunnelId {
 }
 
 impl Error for InvalidTunnelId {}
-
-#[cfg(any(feature = "client", feature = "server"))]
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ServerControlMessage {
-    Ready { url: String },
-    Connection { id: String },
-    Ping,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ClientControlMessage {
-    Pong,
-}
 
 #[cfg(test)]
 mod tests {

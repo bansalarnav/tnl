@@ -10,22 +10,14 @@ name = "tnl"
 [features]
 default = []
 client = [
-    "dep:anyhow",
-    "dep:serde",
-    "dep:serde_json",
+    "dep:muxado",
     "dep:tokio",
 ]
 server = [
-    "dep:anyhow",
-    "dep:serde",
-    "dep:serde_json",
+    "dep:muxado",
     "dep:tokio",
-    "dep:rand",
 ]
 
 [dependencies]
-anyhow = { version = "1.0.104", optional = true }
-rand = { version = "0.8.5", optional = true }
-serde = { version = "1.0.229", features = ["derive"], optional = true }
-serde_json = { version = "1.0.151", optional = true }
-tokio = { version = "1.50.0", features = ["io-util", "macros", "sync", "time"], optional = true }
+muxado = { version = "0.5.4", optional = true }
+tokio = { version = "1.50.0", features = ["io-util", "macros", "rt", "sync"], optional = true }
