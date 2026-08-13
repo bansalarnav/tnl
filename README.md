@@ -113,7 +113,7 @@ Keep accepting while individual streams run concurrently. A background task driv
 
 ### Central side
 
-The transport adapter registers each authenticated node with `TunnelServer`, then runs its `RegisteredTunnel` over the established connection. Application code calls `open` to create a new logical stream to that node; no additional socket or authentication round trip is needed.
+The transport adapter registers each authenticated node connection with `TunnelServer`. Application code calls `open` to create a new logical stream to that node; no additional socket or authentication round trip is needed.
 
 ```rust,no_run
 use std::time::Duration;
@@ -129,16 +129,15 @@ let config = SessionConfig::new()
 let server = TunnelServer::new(config);
 let node_id = TunnelId::new("node-42")?;
 
-// After authenticating the node's transport:
-let tunnel = server
-    .register(node_id.clone())
-    .expect("node is already registered");
-tokio::spawn(tunnel.clone().serve(control));
+// After authenticating the node's transport, registration starts the
+// multiplexed connection driver internally.
+server.register(node_id.clone(), control).await?;
 
-// Node-initiated streams are accepted from the same registered tunnel handle.
-let incoming_tunnel = tunnel.clone();
+// Node-initiated streams can be handled elsewhere through the server.
+let incoming_server = server.clone();
 tokio::spawn(async move {
-    let incoming = incoming_tunnel.accept().await?;
+    let (node_id, incoming) = incoming_server.accept().await?;
+    println!("incoming stream from {node_id}");
     match incoming.tag() {
         "grpc" => { /* serve gRPC over `incoming` */ }
         "files" => { /* receive a file */ }
@@ -158,7 +157,7 @@ if let Some(stream) = server.open(&node_id, "grpc").await? {
 # }
 ```
 
-The node is unregistered when its session driver ends or its last `RegisteredTunnel` handle is dropped. Call `TunnelServer::shutdown` during graceful shutdown to close all sessions and reject new registrations and streams.
+The node is unregistered when its connection driver ends. Call `TunnelServer::shutdown` during graceful shutdown to close all sessions and reject new registrations and streams.
 
 Heartbeat settings must match on both endpoints. Heartbeats are disabled by default; when enabled, a missed deadline closes the multiplexed session. The default maximum is 512 concurrent streams per physical connection.
 

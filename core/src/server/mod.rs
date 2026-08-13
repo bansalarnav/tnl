@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    error::Error,
+    fmt,
     sync::{Arc, Mutex},
 };
 
@@ -20,6 +22,9 @@ pub struct TunnelServer {
     config: SessionConfig,
     state: Arc<Mutex<TunnelRegistry>>,
     shutdown: watch::Sender<bool>,
+    incoming_streams:
+        Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Result<(TunnelId, Stream), ConnectionError>>>>,
+    incoming_sender: mpsc::UnboundedSender<Result<(TunnelId, Stream), ConnectionError>>,
 }
 
 #[derive(Default)]
@@ -37,43 +42,64 @@ struct RegisteredSession {
 impl TunnelServer {
     pub fn new(config: SessionConfig) -> Self {
         let (shutdown, _) = watch::channel(false);
+        let (incoming_sender, incoming_streams) = mpsc::unbounded_channel();
         Self {
             config,
             state: Arc::new(Mutex::new(TunnelRegistry::default())),
             shutdown,
+            incoming_streams: Arc::new(tokio::sync::Mutex::new(incoming_streams)),
+            incoming_sender,
         }
     }
 
-    /// Registers a node after the application has authenticated it.
-    pub fn register(&self, tunnel_id: TunnelId) -> Option<RegisteredTunnel> {
-        let mut state = self.state.lock().expect("server lock was poisoned");
-        if state.shutdown || state.sessions.contains_key(tunnel_id.as_str()) {
-            return None;
+    /// Registers an authenticated node and starts serving its connection.
+    pub async fn register<S>(
+        &self,
+        tunnel_id: TunnelId,
+        connection: S,
+    ) -> Result<(), RegisterError>
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (session_id, open_requests) = {
+            let mut state = self.state.lock().expect("server lock was poisoned");
+            if state.shutdown {
+                return Err(RegisterError::ServerShutdown);
+            }
+            if state.sessions.contains_key(tunnel_id.as_str()) {
+                return Err(RegisterError::AlreadyRegistered);
+            }
+
+            let session_id = state.next_session_id;
+            state.next_session_id = state.next_session_id.wrapping_add(1);
+            let (opener, open_requests) = mpsc::channel(32);
+            state.sessions.insert(
+                tunnel_id.to_string(),
+                RegisteredSession { session_id, opener },
+            );
+            (session_id, open_requests)
+        };
+
+        let parts = match SessionParts::start(connection, false, &self.config).await {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.unregister(&tunnel_id, session_id);
+                return Err(error.into());
+            }
+        };
+
+        if self.is_shutdown() {
+            self.unregister(&tunnel_id, session_id);
+            return Err(RegisterError::ServerShutdown);
         }
 
-        let session_id = state.next_session_id;
-        state.next_session_id = state.next_session_id.wrapping_add(1);
-        let (opener, open_requests) = mpsc::channel(32);
-        let (inbound_streams, inbound_receiver) = mpsc::unbounded_channel();
-        state.sessions.insert(
-            tunnel_id.to_string(),
-            RegisteredSession {
-                session_id,
-                opener: opener.clone(),
-            },
-        );
-
-        Some(RegisteredTunnel {
-            inner: Arc::new(RegisteredTunnelInner {
-                server: self.clone(),
-                tunnel_id,
-                session_id,
-                opener,
-                inbound_streams: Arc::new(tokio::sync::Mutex::new(inbound_receiver)),
-                open_requests: Mutex::new(Some(open_requests)),
-                inbound_sender: Mutex::new(Some(inbound_streams)),
-            }),
-        })
+        let server = self.clone();
+        tokio::spawn(async move {
+            let _ = server
+                .serve(tunnel_id, session_id, open_requests, parts)
+                .await;
+        });
+        Ok(())
     }
 
     /// Opens a tagged bidirectional stream to a registered node.
@@ -94,6 +120,27 @@ impl TunnelServer {
         };
 
         open(&opener, tag.as_ref()).await.map(Some)
+    }
+
+    /// Waits for the next stream opened by any registered node.
+    pub async fn accept(&self) -> Result<(TunnelId, Stream), ConnectionError> {
+        let mut incoming_streams = self.incoming_streams.lock().await;
+        let mut shutdown = self.shutdown.subscribe();
+        loop {
+            if *shutdown.borrow() {
+                return Err(muxado::Error::SessionClosed.into());
+            }
+            tokio::select! {
+                incoming = incoming_streams.recv() => {
+                    return incoming.unwrap_or_else(|| Err(muxado::Error::SessionClosed.into()));
+                }
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        return Err(muxado::Error::SessionClosed.into());
+                    }
+                }
+            }
+        }
     }
 
     /// Closes all registered sessions.
@@ -121,68 +168,20 @@ impl TunnelServer {
             }
         }
     }
-}
 
-impl Clone for TunnelServer {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            state: Arc::clone(&self.state),
-            shutdown: self.shutdown.clone(),
-        }
-    }
-}
-
-impl Default for TunnelServer {
-    fn default() -> Self {
-        Self::new(SessionConfig::default())
-    }
-}
-
-/// The central-server side of a registered multiplexed tunnel session.
-#[derive(Clone)]
-pub struct RegisteredTunnel {
-    inner: Arc<RegisteredTunnelInner>,
-}
-
-struct RegisteredTunnelInner {
-    server: TunnelServer,
-    tunnel_id: TunnelId,
-    session_id: u64,
-    opener: mpsc::Sender<OpenRequest>,
-    inbound_streams:
-        Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Result<Stream, ConnectionError>>>>,
-    open_requests: Mutex<Option<mpsc::Receiver<OpenRequest>>>,
-    inbound_sender: Mutex<Option<mpsc::UnboundedSender<Result<Stream, ConnectionError>>>>,
-}
-
-struct UnregisterOnDrop(Arc<RegisteredTunnelInner>);
-
-impl RegisteredTunnel {
-    /// Runs the session over an already-established transport stream.
-    ///
-    /// This may be called only once for a registered session.
-    pub async fn serve<S>(self, stream: S) -> Result<(), ConnectionError>
-    where
-        S: AsyncRead + AsyncWrite + Send + 'static,
-    {
-        let mut open_requests = self
-            .inner
-            .open_requests
-            .lock()
-            .expect("session lock was poisoned")
-            .take()
-            .ok_or(muxado::Error::SessionClosed)?;
-        let inbound_streams = self
-            .inner
-            .inbound_sender
-            .lock()
-            .expect("session lock was poisoned")
-            .take()
-            .ok_or(muxado::Error::SessionClosed)?;
-        let _unregister = UnregisterOnDrop(Arc::clone(&self.inner));
-        let mut parts = SessionParts::start(stream, false, &self.inner.server.config).await?;
-        let mut shutdown = self.inner.server.shutdown.subscribe();
+    async fn serve(
+        &self,
+        tunnel_id: TunnelId,
+        session_id: u64,
+        mut open_requests: mpsc::Receiver<OpenRequest>,
+        mut parts: SessionParts,
+    ) -> Result<(), ConnectionError> {
+        let _unregister = UnregisterOnDrop {
+            server: self.clone(),
+            tunnel_id: tunnel_id.clone(),
+            session_id,
+        };
+        let mut shutdown = self.shutdown.subscribe();
 
         loop {
             tokio::select! {
@@ -213,10 +212,13 @@ impl RegisteredTunnel {
                         Err(muxado::Error::SessionClosed | muxado::Error::PeerEOF) => break,
                         Err(error) => return Err(error.into()),
                     };
-                    let inbound_streams = inbound_streams.clone();
+                    let tunnel_id = tunnel_id.clone();
+                    let incoming_sender = self.incoming_sender.clone();
                     tokio::spawn(async move {
-                        let stream = Stream::incoming(stream).await;
-                        let _ = inbound_streams.send(stream);
+                        let stream = Stream::incoming(stream)
+                            .await
+                            .map(|stream| (tunnel_id, stream));
+                        let _ = incoming_sender.send(stream);
                     });
                 }
                 result = shutdown.changed() => {
@@ -230,45 +232,78 @@ impl RegisteredTunnel {
         Ok(())
     }
 
-    /// Opens a new tagged bidirectional stream to the node.
-    pub async fn open(&self, tag: impl AsRef<str>) -> Result<Stream, ConnectionError> {
-        open(&self.inner.opener, tag.as_ref()).await
-    }
-
-    /// Waits for the node to open the next tagged bidirectional stream.
-    pub async fn accept(&self) -> Result<Stream, ConnectionError> {
-        self.inner
-            .inbound_streams
-            .lock()
-            .await
-            .recv()
-            .await
-            .unwrap_or_else(|| Err(muxado::Error::SessionClosed.into()))
-    }
-}
-
-impl Drop for RegisteredTunnelInner {
-    fn drop(&mut self) {
-        self.unregister();
-    }
-}
-
-impl RegisteredTunnelInner {
-    fn unregister(&self) {
-        let mut state = self.server.state.lock().expect("server lock was poisoned");
+    fn unregister(&self, tunnel_id: &TunnelId, session_id: u64) {
+        let mut state = self.state.lock().expect("server lock was poisoned");
         if state
             .sessions
-            .get(self.tunnel_id.as_str())
-            .is_some_and(|session| session.session_id == self.session_id)
+            .get(tunnel_id.as_str())
+            .is_some_and(|session| session.session_id == session_id)
         {
-            state.sessions.remove(self.tunnel_id.as_str());
+            state.sessions.remove(tunnel_id.as_str());
         }
     }
 }
 
+impl Clone for TunnelServer {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            state: Arc::clone(&self.state),
+            shutdown: self.shutdown.clone(),
+            incoming_streams: Arc::clone(&self.incoming_streams),
+            incoming_sender: self.incoming_sender.clone(),
+        }
+    }
+}
+
+impl Default for TunnelServer {
+    fn default() -> Self {
+        Self::new(SessionConfig::default())
+    }
+}
+
+struct UnregisterOnDrop {
+    server: TunnelServer,
+    tunnel_id: TunnelId,
+    session_id: u64,
+}
+
 impl Drop for UnregisterOnDrop {
     fn drop(&mut self) {
-        self.0.unregister();
+        self.server.unregister(&self.tunnel_id, self.session_id);
+    }
+}
+
+/// An error registering a node connection with a [`TunnelServer`].
+#[derive(Debug)]
+pub enum RegisterError {
+    AlreadyRegistered,
+    ServerShutdown,
+    Connection(ConnectionError),
+}
+
+impl fmt::Display for RegisterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyRegistered => formatter.write_str("tunnel is already registered"),
+            Self::ServerShutdown => formatter.write_str("tunnel server is shut down"),
+            Self::Connection(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for RegisterError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Connection(error) => Some(error),
+            Self::AlreadyRegistered | Self::ServerShutdown => None,
+        }
+    }
+}
+
+impl From<ConnectionError> for RegisterError {
+    fn from(error: ConnectionError) -> Self {
+        Self::Connection(error)
     }
 }
 

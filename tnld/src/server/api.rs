@@ -69,30 +69,22 @@ async fn open_tunnel(
     let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
         return (StatusCode::BAD_REQUEST, "invalid tunnel name").into_response();
     };
-    let Some(tunnel) = state.tunnel_server.register(tunnel_id.clone()) else {
-        return if state.tunnel_server.is_shutdown() {
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        } else {
-            (StatusCode::CONFLICT, "tunnel name is already in use").into_response()
-        };
-    };
-
     let url = format!("https://{tunnel_id}.{}", state.domain);
     let Ok(url) = HeaderValue::from_str(&url) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let on_upgrade = hyper::upgrade::on(&mut request);
-    let shutdown = state.tunnel_server.clone();
+    let tunnel_server = state.tunnel_server.clone();
     tokio::spawn(async move {
         let result = tokio::select! {
             result = async {
                 let upgraded = on_upgrade.await.map_err(anyhow::Error::from)?;
-                tunnel
-                    .serve(TokioIo::new(upgraded))
+                tunnel_server
+                    .register(tunnel_id.clone(), TokioIo::new(upgraded))
                     .await
                     .map_err(anyhow::Error::from)
             } => Some(result),
-            _ = shutdown.wait_for_shutdown() => None,
+            _ = tunnel_server.wait_for_shutdown() => None,
         };
         if let Some(Err(error)) = result {
             eprintln!("tunnel {tunnel_id} disconnected: {error:#}");
