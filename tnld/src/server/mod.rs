@@ -1,40 +1,24 @@
 mod api;
-mod http;
 mod tls;
-mod tunnel;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
     fs::{self, File},
-    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use axum::Router;
-use rustls::ServerConfig;
-use socket2::{SockRef, TcpKeepalive};
-use tokio::{io::AsyncWriteExt, net::TcpListener};
+use tnl::{
+    TunnelId,
+    server::{HostRoute, Server, ServerEvent, TunnelRegistry, event_handler},
+};
+use tokio::net::TcpListener;
 
 use crate::config::Config;
-
-struct ServerState {
-    domain: String,
-    wildcard_suffix: String,
-    api_tls_config: Arc<ServerConfig>,
-    acme_tls_config: Arc<ServerConfig>,
-    api_router: Router,
-    tunnels: tunnel::TunnelRegistry,
-}
-
-const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 fn state_directory() -> Result<PathBuf> {
     Config::path()?
@@ -48,7 +32,6 @@ fn pid_path() -> Result<PathBuf> {
 }
 
 fn process_is_running(pid: u32) -> bool {
-    // Sending signal 0 checks whether the process exists without changing it.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
@@ -78,68 +61,7 @@ fn get_config() -> Result<Config> {
     if !path.exists() {
         bail!("Run setup first");
     }
-
     Config::get()
-}
-
-async fn handle_connection(stream: tokio::net::TcpStream, state: &ServerState) -> Result<()> {
-    let connection = match tls::inspect(stream).await? {
-        Some(connection) => connection,
-        None => return Ok(()),
-    };
-
-    let Some(server_name) = connection.server_name() else {
-        return Ok(());
-    };
-    let domain = state.domain.as_str();
-
-    if server_name == domain && connection.is_acme_challenge() {
-        let mut stream = connection.terminate(state.acme_tls_config.clone()).await?;
-        stream.shutdown().await?;
-        return Ok(());
-    }
-
-    if server_name == domain {
-        let stream = connection.terminate(state.api_tls_config.clone()).await?;
-        return http::serve(stream, state.api_router.clone()).await;
-    }
-
-    let Some(tunnel_id) = server_name.strip_suffix(&state.wildcard_suffix) else {
-        return Ok(());
-    };
-    if tunnel_id.is_empty() || tunnel_id.contains('.') {
-        return Ok(());
-    }
-    let tunnel_id = tunnel_id.to_owned();
-
-    state.tunnels.forward(&tunnel_id, connection).await
-}
-
-fn is_routine_connection_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        if let Some(error) = cause.downcast_ref::<io::Error>() {
-            return matches!(
-                error.kind(),
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::BrokenPipe
-            );
-        }
-
-        cause.downcast_ref::<rustls::Error>().is_some_and(|error| {
-            matches!(
-                error,
-                rustls::Error::InappropriateMessage { .. }
-                    | rustls::Error::InappropriateHandshakeMessage { .. }
-                    | rustls::Error::InvalidMessage(_)
-                    | rustls::Error::PeerIncompatible(_)
-                    | rustls::Error::PeerMisbehaved(_)
-                    | rustls::Error::AlertReceived(_)
-                    | rustls::Error::NoApplicationProtocol
-            )
-        })
-    })
 }
 
 pub async fn start(background: bool) -> Result<()> {
@@ -181,48 +103,56 @@ pub async fn start(background: bool) -> Result<()> {
     }
 
     let domain = config.domain.trim_end_matches('.').to_ascii_lowercase();
+    let wildcard_suffix = format!(".{domain}");
     let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
-
-    let tunnels = tunnel::TunnelRegistry::new(domain.clone());
-    let state = Arc::new(ServerState {
-        wildcard_suffix: format!(".{domain}"),
-        domain,
-        api_tls_config: tls_configs.api,
-        acme_tls_config: tls_configs.acme_challenge,
-        api_router: api::router(tunnels.clone()),
+    let public_domain = domain.clone();
+    let tunnels =
+        TunnelRegistry::new(move |tunnel_id| format!("https://{tunnel_id}.{public_domain}"));
+    let events = event_handler(print_event);
+    let api_router = api::router(tunnels.clone(), Arc::clone(&events));
+    let route_domain = domain.clone();
+    let server = Server::new(
+        tls_configs.api,
+        tls_configs.acme_challenge,
+        api_router,
         tunnels,
-    });
+        move |server_name| {
+            if server_name == route_domain {
+                return HostRoute::Api;
+            }
+            let Some(tunnel_id) = server_name.strip_suffix(&wildcard_suffix) else {
+                return HostRoute::Reject;
+            };
+            if tunnel_id.contains('.') {
+                return HostRoute::Reject;
+            }
+            TunnelId::new(tunnel_id).map_or(HostRoute::Reject, HostRoute::Tunnel)
+        },
+        events,
+    );
 
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.listen_port);
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("could not listen on {address}"))?;
-
     println!("Server listening on {address}");
 
-    loop {
-        let (stream, peer_address) = listener.accept().await?;
-        if let Err(error) = configure_tcp_keepalive(&stream) {
-            eprintln!("could not configure TCP keepalive for {peer_address}: {error}");
-        }
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, &state).await
-                && !is_routine_connection_error(&error)
-            {
-                eprintln!("connection from {peer_address} failed: {error:#}");
-            }
-        });
-    }
+    server.serve(listener).await
 }
 
-fn configure_tcp_keepalive(stream: &tokio::net::TcpStream) -> io::Result<()> {
-    SockRef::from(stream).set_tcp_keepalive(
-        &TcpKeepalive::new()
-            .with_time(TCP_KEEPALIVE_IDLE)
-            .with_interval(TCP_KEEPALIVE_INTERVAL)
-            .with_retries(TCP_KEEPALIVE_RETRIES),
-    )
+fn print_event(event: ServerEvent) {
+    match event {
+        ServerEvent::TunnelDisconnected { tunnel_id, error } => {
+            eprintln!("tunnel {tunnel_id} disconnected: {error}");
+        }
+        ServerEvent::DataConnectionUpgradeFailed { error } => {
+            eprintln!("data connection upgrade failed: {error}");
+        }
+        ServerEvent::ConnectionFailed {
+            peer_address,
+            error,
+        } => eprintln!("connection from {peer_address} failed: {error}"),
+    }
 }
 
 pub fn stop() -> Result<()> {

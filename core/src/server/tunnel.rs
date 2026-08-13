@@ -4,11 +4,15 @@ use anyhow::{Context, Result, bail};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use rand::{Rng, distributions::Alphanumeric};
-use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy_bidirectional},
     sync::{Mutex, mpsc, oneshot},
     time::{Instant, MissedTickBehavior, interval_at, timeout},
+};
+
+use crate::{
+    TunnelId,
+    protocol::{ClientControlMessage, ServerControlMessage},
 };
 
 use super::tls::TlsConnection;
@@ -17,9 +21,11 @@ const DATA_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
+type PublicUrl = Arc<dyn Fn(&TunnelId) -> String + Send + Sync>;
+
 #[derive(Clone)]
 pub struct TunnelRegistry {
-    domain: Arc<str>,
+    public_url: PublicUrl,
     state: Arc<Mutex<State>>,
 }
 
@@ -40,43 +46,29 @@ struct PendingConnection {
     sender: oneshot::Sender<TokioIo<Upgraded>>,
 }
 
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ControlMessage<'a> {
-    Ready { url: &'a str },
-    Connection { id: &'a str },
-    Ping,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClientControlMessage {
-    Pong,
-}
-
 pub struct Registration {
     pub session_id: u64,
     pub receiver: mpsc::Receiver<String>,
 }
 
 impl TunnelRegistry {
-    pub fn new(domain: String) -> Self {
+    pub fn new(public_url: impl Fn(&TunnelId) -> String + Send + Sync + 'static) -> Self {
         Self {
-            domain: domain.into(),
+            public_url: Arc::new(public_url),
             state: Arc::new(Mutex::new(State::default())),
         }
     }
 
-    pub async fn register(&self, tunnel_id: &str, owner: &str) -> Option<Registration> {
+    pub async fn register(&self, tunnel_id: &TunnelId, owner: &str) -> Option<Registration> {
         let mut state = self.state.lock().await;
-        if state.tunnels.contains_key(tunnel_id) {
+        if state.tunnels.contains_key(tunnel_id.as_str()) {
             return None;
         }
 
         let session_id = rand::thread_rng().r#gen();
         let (sender, receiver) = mpsc::channel(32);
         state.tunnels.insert(
-            tunnel_id.to_owned(),
+            tunnel_id.to_string(),
             Tunnel {
                 session_id,
                 owner: owner.to_owned(),
@@ -89,14 +81,14 @@ impl TunnelRegistry {
         })
     }
 
-    pub async fn unregister(&self, tunnel_id: &str, session_id: u64) {
+    pub async fn unregister(&self, tunnel_id: &TunnelId, session_id: u64) {
         let mut state = self.state.lock().await;
         if state
             .tunnels
-            .get(tunnel_id)
+            .get(tunnel_id.as_str())
             .is_some_and(|tunnel| tunnel.session_id == session_id)
         {
-            state.tunnels.remove(tunnel_id);
+            state.tunnels.remove(tunnel_id.as_str());
         }
     }
 
@@ -121,14 +113,19 @@ impl TunnelRegistry {
 
     pub async fn serve_control(
         &self,
-        tunnel_id: String,
+        tunnel_id: TunnelId,
         mut receiver: mpsc::Receiver<String>,
         upgraded: Upgraded,
     ) -> Result<()> {
         let (reader, mut writer) = tokio::io::split(TokioIo::new(upgraded));
         let mut reader = BufReader::new(reader);
-        let url = format!("https://{tunnel_id}.{}", self.domain);
-        write_message(&mut writer, &ControlMessage::Ready { url: &url }).await?;
+        write_message(
+            &mut writer,
+            &ServerControlMessage::Ready {
+                url: (self.public_url)(&tunnel_id),
+            },
+        )
+        .await?;
 
         let mut heartbeat = interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -154,7 +151,7 @@ impl TunnelRegistry {
                     };
                     write_message(
                         &mut writer,
-                        &ControlMessage::Connection { id: &connection_id },
+                        &ServerControlMessage::Connection { id: connection_id },
                     )
                     .await?;
                 }
@@ -162,7 +159,7 @@ impl TunnelRegistry {
                     if last_pong.elapsed() >= HEARTBEAT_TIMEOUT {
                         bail!("tunnel client missed the heartbeat deadline");
                     }
-                    write_message(&mut writer, &ControlMessage::Ping).await?;
+                    write_message(&mut writer, &ServerControlMessage::Ping).await?;
                 }
             }
         }
@@ -170,10 +167,10 @@ impl TunnelRegistry {
         Ok(())
     }
 
-    pub async fn forward(&self, tunnel_id: &str, connection: TlsConnection) -> Result<()> {
+    pub async fn forward(&self, tunnel_id: &TunnelId, connection: TlsConnection) -> Result<()> {
         let (owner, sender) = {
             let state = self.state.lock().await;
-            let Some(tunnel) = state.tunnels.get(tunnel_id) else {
+            let Some(tunnel) = state.tunnels.get(tunnel_id.as_str()) else {
                 return Ok(());
             };
             (tunnel.owner.clone(), tunnel.sender.clone())
@@ -229,7 +226,7 @@ impl TunnelRegistry {
 
 async fn write_message(
     stream: &mut (impl AsyncWrite + Unpin),
-    message: &ControlMessage<'_>,
+    message: &ServerControlMessage,
 ) -> Result<()> {
     let mut json = serde_json::to_vec(message)?;
     json.push(b'\n');
