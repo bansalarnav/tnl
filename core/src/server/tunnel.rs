@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use hyper::upgrade::Upgraded;
@@ -6,7 +10,7 @@ use hyper_util::rt::TokioIo;
 use rand::{Rng, distributions::Alphanumeric};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, copy_bidirectional},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::{Instant, MissedTickBehavior, interval_at, timeout},
 };
 
@@ -23,10 +27,12 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 type PublicUrl = Arc<dyn Fn(&TunnelId) -> String + Send + Sync>;
 
+/// Tracks registered nodes and pairs central-initiated connections with them.
 #[derive(Clone)]
 pub struct TunnelRegistry {
     public_url: PublicUrl,
     state: Arc<Mutex<State>>,
+    shutdown: watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -43,24 +49,80 @@ struct Tunnel {
 
 struct PendingConnection {
     owner: String,
-    sender: oneshot::Sender<TokioIo<Upgraded>>,
+    sender: oneshot::Sender<TunnelConnection>,
 }
 
-pub struct Registration {
-    pub session_id: u64,
-    pub receiver: mpsc::Receiver<String>,
+struct PendingRequest {
+    connection_id: String,
+    state: Arc<Mutex<State>>,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .expect("tunnel registry lock was poisoned")
+            .pending_connections
+            .remove(&self.connection_id);
+    }
+}
+
+/// The central side of a raw connection requested from a registered node.
+pub type TunnelConnection = TokioIo<Upgraded>;
+
+pub(crate) struct Registration {
+    pub(crate) session_id: u64,
+    pub(crate) receiver: mpsc::Receiver<String>,
 }
 
 impl TunnelRegistry {
-    pub fn new(public_url: impl Fn(&TunnelId) -> String + Send + Sync + 'static) -> Self {
+    /// Creates a registry whose ready value is the registered tunnel ID.
+    pub fn new() -> Self {
+        Self::with_public_url(|tunnel_id| tunnel_id.to_string())
+    }
+
+    /// Creates a registry with a custom ready value, such as a public tunnel URL.
+    pub fn with_public_url(
+        public_url: impl Fn(&TunnelId) -> String + Send + Sync + 'static,
+    ) -> Self {
+        let (shutdown, _) = watch::channel(false);
         Self {
             public_url: Arc::new(public_url),
             state: Arc::new(Mutex::new(State::default())),
+            shutdown,
         }
     }
 
-    pub async fn register(&self, tunnel_id: &TunnelId, owner: &str) -> Option<Registration> {
-        let mut state = self.state.lock().await;
+    /// Closes registered control sessions and cancels pending connection requests.
+    pub fn shutdown(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("tunnel registry lock was poisoned");
+        state.tunnels.clear();
+        state.pending_connections.clear();
+        drop(state);
+        self.shutdown.send_replace(true);
+    }
+
+    /// Returns whether this registry has begun shutting down.
+    pub fn is_shutdown(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    pub(crate) fn shutdown_signal(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    pub(crate) async fn register(&self, tunnel_id: &TunnelId, owner: &str) -> Option<Registration> {
+        if self.is_shutdown() {
+            return None;
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("tunnel registry lock was poisoned");
         if state.tunnels.contains_key(tunnel_id.as_str()) {
             return None;
         }
@@ -81,8 +143,11 @@ impl TunnelRegistry {
         })
     }
 
-    pub async fn unregister(&self, tunnel_id: &TunnelId, session_id: u64) {
-        let mut state = self.state.lock().await;
+    pub(crate) async fn unregister(&self, tunnel_id: &TunnelId, session_id: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("tunnel registry lock was poisoned");
         if state
             .tunnels
             .get(tunnel_id.as_str())
@@ -92,12 +157,15 @@ impl TunnelRegistry {
         }
     }
 
-    pub async fn attach(
+    pub(crate) async fn attach(
         &self,
         connection_id: &str,
         owner: &str,
-    ) -> Option<oneshot::Sender<TokioIo<Upgraded>>> {
-        let mut state = self.state.lock().await;
+    ) -> Option<oneshot::Sender<TunnelConnection>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("tunnel registry lock was poisoned");
         if state
             .pending_connections
             .get(connection_id)
@@ -111,7 +179,7 @@ impl TunnelRegistry {
         None
     }
 
-    pub async fn serve_control(
+    pub(crate) async fn serve_control(
         &self,
         tunnel_id: TunnelId,
         mut receiver: mpsc::Receiver<String>,
@@ -167,11 +235,21 @@ impl TunnelRegistry {
         Ok(())
     }
 
-    pub async fn forward(&self, tunnel_id: &TunnelId, connection: TlsConnection) -> Result<()> {
+    /// Requests a raw bidirectional connection from a registered node.
+    ///
+    /// Returns `Ok(None)` when the node is not currently registered.
+    pub async fn connect(&self, tunnel_id: &TunnelId) -> Result<Option<TunnelConnection>> {
+        if self.is_shutdown() {
+            bail!("tunnel registry is shut down");
+        }
+
         let (owner, sender) = {
-            let state = self.state.lock().await;
+            let state = self
+                .state
+                .lock()
+                .expect("tunnel registry lock was poisoned");
             let Some(tunnel) = state.tunnels.get(tunnel_id.as_str()) else {
-                return Ok(());
+                return Ok(None);
             };
             (tunnel.owner.clone(), tunnel.sender.clone())
         };
@@ -182,34 +260,43 @@ impl TunnelRegistry {
             .map(char::from)
             .collect();
         let (data_sender, data_receiver) = oneshot::channel();
-        self.state.lock().await.pending_connections.insert(
-            connection_id.clone(),
-            PendingConnection {
-                owner,
-                sender: data_sender,
-            },
-        );
+        self.state
+            .lock()
+            .expect("tunnel registry lock was poisoned")
+            .pending_connections
+            .insert(
+                connection_id.clone(),
+                PendingConnection {
+                    owner,
+                    sender: data_sender,
+                },
+            );
+        let pending_request = PendingRequest {
+            connection_id: connection_id.clone(),
+            state: Arc::clone(&self.state),
+        };
 
         if sender.send(connection_id.clone()).await.is_err() {
-            self.state
-                .lock()
-                .await
-                .pending_connections
-                .remove(&connection_id);
             bail!("tunnel client disconnected");
         }
 
-        let mut data_stream = match timeout(DATA_CONNECTION_TIMEOUT, data_receiver).await {
+        let data_stream = match timeout(DATA_CONNECTION_TIMEOUT, data_receiver).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(_)) => bail!("tunnel data connection was not established"),
-            Err(_) => {
-                self.state
-                    .lock()
-                    .await
-                    .pending_connections
-                    .remove(&connection_id);
-                bail!("timed out waiting for the tunnel data connection");
-            }
+            Err(_) => bail!("timed out waiting for the tunnel data connection"),
+        };
+        drop(pending_request);
+
+        Ok(Some(data_stream))
+    }
+
+    pub(crate) async fn forward(
+        &self,
+        tunnel_id: &TunnelId,
+        connection: TlsConnection,
+    ) -> Result<()> {
+        let Some(mut data_stream) = self.connect(tunnel_id).await? else {
+            return Ok(());
         };
 
         let (client_hello, mut visitor_stream) = connection.into_raw_parts();
@@ -221,6 +308,12 @@ impl TunnelRegistry {
             .await
             .context("tunnel forwarding failed")?;
         Ok(())
+    }
+}
+
+impl Default for TunnelRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::TunnelId;
 
-use super::{ClientIdentity, EventHandler, ServerEvent, ShutdownSignal, TunnelRegistry};
+use super::{ClientIdentity, EventHandler, ServerEvent, TunnelRegistry};
 
 pub fn router(tunnels: TunnelRegistry, events: EventHandler) -> Router {
     Router::new()
@@ -29,10 +29,13 @@ struct ApiState {
 async fn open_tunnel(
     State(state): State<ApiState>,
     Extension(client): Extension<ClientIdentity>,
-    shutdown: Option<Extension<ShutdownSignal>>,
     Path(tunnel_id): Path<String>,
     mut request: Request<Body>,
 ) -> Response {
+    if state.tunnels.is_shutdown() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
     let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
         return (StatusCode::BAD_REQUEST, "invalid tunnel name").into_response();
     };
@@ -42,6 +45,7 @@ async fn open_tunnel(
     };
 
     let on_upgrade = hyper::upgrade::on(&mut request);
+    let mut shutdown = state.tunnels.shutdown_signal();
     tokio::spawn(async move {
         let serve = async {
             let upgraded = on_upgrade.await?;
@@ -51,12 +55,9 @@ async fn open_tunnel(
                 .await
         };
 
-        let result = match shutdown {
-            Some(Extension(mut shutdown)) => tokio::select! {
-                result = serve => Some(result),
-                _ = shutdown.0.changed() => None,
-            },
-            None => Some(serve.await),
+        let result = tokio::select! {
+            result = serve => Some(result),
+            _ = shutdown.wait_for(|shutdown| *shutdown) => None,
         };
 
         state
@@ -77,7 +78,6 @@ async fn open_tunnel(
 async fn open_connection(
     State(state): State<ApiState>,
     Extension(client): Extension<ClientIdentity>,
-    shutdown: Option<Extension<ShutdownSignal>>,
     Path(connection_id): Path<String>,
     mut request: Request<Body>,
 ) -> Response {
@@ -86,6 +86,7 @@ async fn open_connection(
     };
 
     let on_upgrade = hyper::upgrade::on(&mut request);
+    let mut shutdown = state.tunnels.shutdown_signal();
     tokio::spawn(async move {
         let upgrade = async {
             match on_upgrade.await {
@@ -98,12 +99,9 @@ async fn open_connection(
             }
         };
 
-        match shutdown {
-            Some(Extension(mut shutdown)) => tokio::select! {
-                _ = upgrade => {}
-                _ = shutdown.0.changed() => {}
-            },
-            None => upgrade.await,
+        tokio::select! {
+            _ = upgrade => {}
+            _ = shutdown.wait_for(|shutdown| *shutdown) => {}
         }
     });
 

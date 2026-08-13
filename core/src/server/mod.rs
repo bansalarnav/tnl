@@ -6,15 +6,15 @@ mod tunnel;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use axum::{Extension, Router};
+use axum::Router;
 use rustls::ServerConfig;
 use socket2::{SockRef, TcpKeepalive};
-use tokio::{io::AsyncWriteExt, net::TcpListener, sync::watch, task::JoinSet};
+use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 
 use crate::TunnelId;
 
 pub use api::router as api_router;
-pub use tunnel::TunnelRegistry;
+pub use tunnel::{TunnelConnection, TunnelRegistry};
 
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -63,9 +63,6 @@ pub enum HostRoute {
 
 type HostRouter = Arc<dyn Fn(&str) -> HostRoute + Send + Sync>;
 
-#[derive(Clone)]
-struct ShutdownSignal(watch::Receiver<()>);
-
 pub struct Server {
     api_tls_config: Arc<ServerConfig>,
     acme_tls_config: Arc<ServerConfig>,
@@ -94,15 +91,18 @@ impl Server {
         }
     }
 
-    pub async fn serve(mut self, listener: TcpListener) -> Result<()> {
-        let (shutdown_sender, shutdown_receiver) = watch::channel(());
-        self.api_router = self
-            .api_router
-            .layer(Extension(ShutdownSignal(shutdown_receiver)));
+    pub async fn serve(self, listener: TcpListener) -> Result<()> {
+        struct ShutdownOnDrop(TunnelRegistry);
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                self.0.shutdown();
+            }
+        }
 
+        let shutdown = ShutdownOnDrop(self.tunnels.clone());
         let server = Arc::new(self);
         let mut connection_tasks = JoinSet::new();
-        let _shutdown_sender = shutdown_sender;
+        let _shutdown = shutdown;
         loop {
             let (stream, peer_address) = listener.accept().await?;
             if let Err(error) = configure_tcp_keepalive(&stream) {

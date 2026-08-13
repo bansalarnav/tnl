@@ -14,14 +14,17 @@ client = [
     "dep:serde",
     "dep:serde_json",
     "dep:tokio",
-    "dep:rand",
     "dep:rustls",
-    "dep:rustls-acme",
     "dep:socket2",
     "dep:tokio-rustls",
-    "dep:tokio-stream",
     "dep:url",
     "dep:webpki-roots",
+]
+forwarding = [
+    "client",
+    "dep:rand",
+    "dep:rustls-acme",
+    "dep:tokio-stream",
 ]
 server = [
     "dep:anyhow",

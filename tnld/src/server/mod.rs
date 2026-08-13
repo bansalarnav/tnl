@@ -106,8 +106,9 @@ pub async fn start(background: bool) -> Result<()> {
     let wildcard_suffix = format!(".{domain}");
     let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
     let public_domain = domain.clone();
-    let tunnels =
-        TunnelRegistry::new(move |tunnel_id| format!("https://{tunnel_id}.{public_domain}"));
+    let tunnels = TunnelRegistry::with_public_url(move |tunnel_id| {
+        format!("https://{tunnel_id}.{public_domain}")
+    });
     let events = event_handler(print_event);
     let api_router = api::router(tunnels.clone(), Arc::clone(&events));
     let route_domain = domain.clone();

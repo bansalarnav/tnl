@@ -8,7 +8,7 @@ Expose a local HTTP service through your own public `tnld` server. The public en
 
 The workspace contains three packages:
 
-- `tnl-core` in `core/` (imported as `tnl`): the embeddable tunneling library, with additive `client` and `server` features
+- `tnl-core` in `core/` (imported as `tnl`): the embeddable tunneling library, with additive `client`, `forwarding`, and `server` features
 - `tnlc`: the command-line tunnel client
 - `tnld`: the command-line tunnel server
 
@@ -67,10 +67,10 @@ cargo run --release -p tnld -- stop
 
 ## Embed the client
 
-Depend on the core package with its client feature:
+Depend on the core package with its forwarding feature:
 
 ```toml
-tnl = { package = "tnl-core", path = "core", features = ["client"] }
+tnl = { package = "tnl-core", path = "core", features = ["forwarding"] }
 ```
 
 Then construct the client from application-owned values:
@@ -81,19 +81,48 @@ use std::{
     path::PathBuf,
 };
 
-use tnl::{TunnelId, client::Client};
+use tnl::{TunnelId, client::{Client, Forwarder}};
 use url::Url;
 
 # async fn example() -> anyhow::Result<()> {
-let client = Client::new(
-    Url::parse("https://tunnel.example.com")?,
-    PathBuf::from("./acme-cache"),
-)?
-.with_authorization("Bearer secret-token")?;
+let client = Client::new(Url::parse("https://tunnel.example.com")?)?
+    .with_authorization("Bearer secret-token")?;
+let forwarder = Forwarder::new(client, PathBuf::from("./acme-cache"));
 let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000);
-client.expose(target, TunnelId::new("my-app")?).await?;
+forwarder.expose(target, TunnelId::new("my-app")?).await?;
 # Ok(())
 # }
 ```
 
 The `server` feature exposes the corresponding `Server`, `TunnelRegistry`, API router, authenticated identity, hostname-routing, and event types. Applications provide their own listener, authentication middleware, hostname policy, certificates, and event handling.
+
+## Use raw bidirectional connections
+
+The lower-level `client` feature does not depend on forwarding or certificate management. A node registers a session and accepts connection requests from the central server:
+
+```rust,no_run
+use tnl::{TunnelId, client::Client};
+use url::Url;
+
+# async fn node() -> anyhow::Result<()> {
+let client = Client::new(Url::parse("https://tunnel.example.com")?)?
+    .with_authorization("Bearer secret-token")?;
+let mut session = client.register(&TunnelId::new("my-node")?).await?;
+session.wait_until_ready().await?;
+
+loop {
+    let request = session.accept().await?;
+    tokio::spawn(async move {
+        let connection = request.connect().await?;
+        // `connection` implements Tokio AsyncRead + AsyncWrite. Serve gRPC,
+        // another framed protocol, or application-specific traffic over it.
+        drop(connection);
+        Ok::<_, anyhow::Error>(())
+    });
+}
+# }
+```
+
+Keep the accept loop running and handle each connection concurrently so the session can continue answering heartbeats.
+
+On the central side, `TunnelRegistry::connect` requests a matching raw stream from that node. This can be used independently of `Server`; create a plain `TunnelRegistry::new()`, mount `api_router` in an existing authenticated Axum service, and insert a `ClientIdentity` in middleware. Call `TunnelRegistry::shutdown` during graceful shutdown to close registered control sessions and pending connection requests. The returned client and server connection types both implement Tokio `AsyncRead` and `AsyncWrite`, so forwarding is only one possible use. Public hostname forwarding can instead use `TunnelRegistry::with_public_url` to customize the ready value sent to clients. Use `Client::with_tls_config` when nodes need a private CA or mutual TLS.

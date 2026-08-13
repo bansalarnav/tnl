@@ -11,6 +11,6 @@ dirs = "6.0.0"
 rand = "0.8.5"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tnl = { package = "tnl-core", path = "../core", features = ["client"] }
+tnl = { package = "tnl-core", path = "../core", features = ["forwarding"] }
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
 url = "2.5.8"

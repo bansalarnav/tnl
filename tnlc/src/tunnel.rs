@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use rand::{Rng, distributions::Alphanumeric};
 use tnl::{
     TunnelId,
-    client::{Client, ClientEvent},
+    client::{Client, ClientEvent, Forwarder},
 };
 use url::Url;
 
@@ -20,17 +20,20 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
         Some(name) => TunnelId::new(name.to_ascii_lowercase())?,
         None => default_tunnel_id()?,
     };
+    let api_url = Url::parse(&config.api_url).context("config contains an invalid API URL")?;
+    let client = Client::new(api_url)?;
+    if config.token.is_empty() || config.token.chars().any(char::is_control) {
+        bail!("config contains an invalid token");
+    }
     let cache_directory = config::path()?
         .parent()
         .context("tnlc config path does not have a parent directory")?
         .join("acme");
-    let api_url = Url::parse(&config.api_url).context("config contains an invalid API URL")?;
-    let client = Client::new(api_url, cache_directory)?
-        .with_authorization(format!("Bearer {}", config.token))?
-        .with_event_handler(print_event);
+    let client = client.with_authorization(format!("Bearer {}", config.token))?;
+    let forwarder = Forwarder::new(client, cache_directory).with_event_handler(print_event);
     let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
-    client.expose(target, tunnel_id).await
+    forwarder.expose(target, tunnel_id).await
 }
 
 fn print_event(event: ClientEvent) {

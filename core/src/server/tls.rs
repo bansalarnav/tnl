@@ -27,11 +27,9 @@ impl TlsConnection {
         self.accepted
             .client_hello()
             .alpn()
-            .is_some_and(|protocols| {
-                protocols
-                    .into_iter()
-                    .any(|protocol| protocol == b"acme-tls/1")
-            })
+            .into_iter()
+            .flatten()
+            .eq([b"acme-tls/1".as_slice()])
     }
 
     pub async fn terminate(self, config: Arc<ServerConfig>) -> Result<TlsStream<TcpStream>> {
