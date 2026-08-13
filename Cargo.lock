@@ -1619,20 +1619,10 @@ name = "tnl-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
- "hyper",
- "hyper-util",
  "rand",
- "rustls",
- "rustls-acme",
  "serde",
  "serde_json",
- "socket2",
  "tokio",
- "tokio-rustls",
- "tokio-stream",
- "url",
- "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -1644,11 +1634,17 @@ dependencies = [
  "clap",
  "dirs",
  "rand",
+ "rustls",
+ "rustls-acme",
  "serde",
  "serde_json",
+ "socket2",
  "tnl-core",
  "tokio",
+ "tokio-rustls",
+ "tokio-stream",
  "url",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -1660,6 +1656,8 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "dirs",
+ "hyper",
+ "hyper-util",
  "libc",
  "rand",
  "rustls",
@@ -1667,8 +1665,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "tnl-core",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "ureq",
 ]

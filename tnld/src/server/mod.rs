@@ -1,24 +1,49 @@
 mod api;
+mod http;
 mod tls;
+mod tunnel;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
     fs::{self, File},
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use tnl::{
-    TunnelId,
-    server::{HostRoute, Server, ServerEvent, TunnelRegistry, event_handler},
+use axum::Router;
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
+use rustls::ServerConfig;
+use socket2::{SockRef, TcpKeepalive};
+use tnl::{TunnelId, server::Broker};
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, TcpStream},
+    task::JoinSet,
 };
-use tokio::net::TcpListener;
 
 use crate::config::Config;
+
+pub type DataStream = TokioIo<Upgraded>;
+
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+struct ServerState {
+    domain: String,
+    wildcard_suffix: String,
+    api_tls_config: Arc<ServerConfig>,
+    acme_tls_config: Arc<ServerConfig>,
+    api_router: Router,
+    broker: Broker<DataStream>,
+}
 
 fn state_directory() -> Result<PathBuf> {
     Config::path()?
@@ -106,31 +131,16 @@ pub async fn start(background: bool) -> Result<()> {
     let wildcard_suffix = format!(".{domain}");
     let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
     let public_domain = domain.clone();
-    let tunnels = TunnelRegistry::with_public_url(move |tunnel_id| {
-        format!("https://{tunnel_id}.{public_domain}")
+    let broker =
+        Broker::with_ready_value(move |tunnel_id| format!("https://{tunnel_id}.{public_domain}"));
+    let state = Arc::new(ServerState {
+        wildcard_suffix,
+        domain,
+        api_tls_config: tls_configs.api,
+        acme_tls_config: tls_configs.acme_challenge,
+        api_router: api::router(broker.clone()),
+        broker: broker.clone(),
     });
-    let events = event_handler(print_event);
-    let api_router = api::router(tunnels.clone(), Arc::clone(&events));
-    let route_domain = domain.clone();
-    let server = Server::new(
-        tls_configs.api,
-        tls_configs.acme_challenge,
-        api_router,
-        tunnels,
-        move |server_name| {
-            if server_name == route_domain {
-                return HostRoute::Api;
-            }
-            let Some(tunnel_id) = server_name.strip_suffix(&wildcard_suffix) else {
-                return HostRoute::Reject;
-            };
-            if tunnel_id.contains('.') {
-                return HostRoute::Reject;
-            }
-            TunnelId::new(tunnel_id).map_or(HostRoute::Reject, HostRoute::Tunnel)
-        },
-        events,
-    );
 
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.listen_port);
     let listener = TcpListener::bind(address)
@@ -138,22 +148,99 @@ pub async fn start(background: bool) -> Result<()> {
         .with_context(|| format!("could not listen on {address}"))?;
     println!("Server listening on {address}");
 
-    server.serve(listener).await
+    struct ShutdownOnDrop(Broker<DataStream>);
+    impl Drop for ShutdownOnDrop {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+    let _shutdown = ShutdownOnDrop(broker);
+    let mut connections = JoinSet::new();
+    loop {
+        let (stream, peer_address) = listener.accept().await?;
+        if let Err(error) = configure_tcp_keepalive(&stream) {
+            eprintln!("could not configure TCP keepalive for {peer_address}: {error}");
+        }
+        let state = Arc::clone(&state);
+        while connections.try_join_next().is_some() {}
+        connections.spawn(async move {
+            if let Err(error) = handle_connection(stream, &state).await
+                && !is_routine_connection_error(&error)
+            {
+                eprintln!("connection from {peer_address} failed: {error:#}");
+            }
+        });
+    }
 }
 
-fn print_event(event: ServerEvent) {
-    match event {
-        ServerEvent::TunnelDisconnected { tunnel_id, error } => {
-            eprintln!("tunnel {tunnel_id} disconnected: {error}");
-        }
-        ServerEvent::DataConnectionUpgradeFailed { error } => {
-            eprintln!("data connection upgrade failed: {error}");
-        }
-        ServerEvent::ConnectionFailed {
-            peer_address,
-            error,
-        } => eprintln!("connection from {peer_address} failed: {error}"),
+async fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
+    let connection = match tls::inspect(stream).await? {
+        Some(connection) => connection,
+        None => return Ok(()),
+    };
+    let Some(server_name) = connection.server_name() else {
+        return Ok(());
+    };
+
+    if server_name == state.domain && connection.is_acme_challenge() {
+        let mut stream = connection
+            .terminate(Arc::clone(&state.acme_tls_config))
+            .await?;
+        stream.shutdown().await?;
+        return Ok(());
     }
+    if server_name == state.domain {
+        let stream = connection
+            .terminate(Arc::clone(&state.api_tls_config))
+            .await?;
+        return http::serve(stream, state.api_router.clone()).await;
+    }
+
+    let Some(tunnel_id) = server_name.strip_suffix(&state.wildcard_suffix) else {
+        return Ok(());
+    };
+    if tunnel_id.contains('.') {
+        return Ok(());
+    }
+    let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
+        return Ok(());
+    };
+    tunnel::forward(&state.broker, &tunnel_id, connection).await
+}
+
+fn configure_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {
+    SockRef::from(stream).set_tcp_keepalive(
+        &TcpKeepalive::new()
+            .with_time(TCP_KEEPALIVE_IDLE)
+            .with_interval(TCP_KEEPALIVE_INTERVAL)
+            .with_retries(TCP_KEEPALIVE_RETRIES),
+    )
+}
+
+fn is_routine_connection_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<io::Error>() {
+            return matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+            );
+        }
+        cause.downcast_ref::<rustls::Error>().is_some_and(|error| {
+            matches!(
+                error,
+                rustls::Error::InappropriateMessage { .. }
+                    | rustls::Error::InappropriateHandshakeMessage { .. }
+                    | rustls::Error::InvalidMessage(_)
+                    | rustls::Error::PeerIncompatible(_)
+                    | rustls::Error::PeerMisbehaved(_)
+                    | rustls::Error::AlertReceived(_)
+                    | rustls::Error::NoApplicationProtocol
+            )
+        })
+    })
 }
 
 pub fn stop() -> Result<()> {

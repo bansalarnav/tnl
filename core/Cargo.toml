@@ -14,45 +14,18 @@ client = [
     "dep:serde",
     "dep:serde_json",
     "dep:tokio",
-    "dep:rustls",
-    "dep:socket2",
-    "dep:tokio-rustls",
-    "dep:url",
-    "dep:webpki-roots",
-]
-forwarding = [
-    "client",
-    "dep:rand",
-    "dep:rustls-acme",
-    "dep:tokio-stream",
 ]
 server = [
     "dep:anyhow",
     "dep:serde",
     "dep:serde_json",
     "dep:tokio",
-    "dep:axum",
-    "dep:hyper",
-    "dep:hyper-util",
     "dep:rand",
-    "dep:rustls",
-    "dep:socket2",
-    "dep:tokio-rustls",
 ]
 
 [dependencies]
 anyhow = { version = "1.0.104", optional = true }
-axum = { version = "0.8.8", optional = true }
-hyper = { version = "1.8.1", features = ["http1", "server"], optional = true }
-hyper-util = { version = "0.1.20", features = ["http1", "http2", "server", "service", "tokio"], optional = true }
 rand = { version = "0.8.5", optional = true }
-rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"], optional = true }
-rustls-acme = { version = "0.15.3", default-features = false, features = ["ring", "tls12", "tokio", "webpki-roots"], optional = true }
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 serde_json = { version = "1.0.151", optional = true }
-socket2 = { version = "0.6.5", features = ["all"], optional = true }
-tokio = { version = "1.50.0", features = ["io-util", "net", "rt", "sync", "time"], optional = true }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"], optional = true }
-tokio-stream = { version = "0.1.18", optional = true }
-url = { version = "2.5.8", optional = true }
-webpki-roots = { version = "1.0.6", optional = true }
+tokio = { version = "1.50.0", features = ["io-util", "macros", "sync", "time"], optional = true }

@@ -8,9 +8,9 @@ Expose a local HTTP service through your own public `tnld` server. The public en
 
 The workspace contains three packages:
 
-- `tnl-core` in `core/` (imported as `tnl`): the embeddable tunneling library, with additive `client`, `forwarding`, and `server` features
-- `tnlc`: the command-line tunnel client
-- `tnld`: the command-line tunnel server
+- `tnl-core` in `core/` (imported as `tnl`): transport-neutral tunnel sessions and connection pairing
+- `tnlc`: the command-line client, including HTTPS transport, ACME, and local forwarding
+- `tnld`: the command-line server, including authentication, HTTP upgrades, TLS, SNI routing, and public forwarding
 
 ## Requirements
 
@@ -65,64 +65,81 @@ Keep this command running while the tunnel is in use. To stop a background serve
 cargo run --release -p tnld -- stop
 ```
 
-## Embed the client
+## Core API
 
-Depend on the core package with its forwarding feature:
+`tnl-core` handles the control protocol, heartbeats, registration ownership, and connection pairing. It does not open sockets or depend on HTTP, TLS, Axum, Hyper, ACME, hostnames, or authentication policy.
+
+Enable either or both sides:
 
 ```toml
-tnl = { package = "tnl-core", path = "core", features = ["forwarding"] }
+tnl = { package = "tnl-core", path = "core", features = ["client", "server"] }
 ```
 
-Then construct the client from application-owned values:
+### Node side
+
+Pass an already-established Tokio `AsyncRead + AsyncWrite` control stream to `ClientSession`. How that stream is authenticated and transported is application-owned.
 
 ```rust,no_run
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
-};
+use tnl::client::ClientSession;
 
-use tnl::{TunnelId, client::{Client, Forwarder}};
-use url::Url;
-
-# async fn example() -> anyhow::Result<()> {
-let client = Client::new(Url::parse("https://tunnel.example.com")?)?
-    .with_authorization("Bearer secret-token")?;
-let forwarder = Forwarder::new(client, PathBuf::from("./acme-cache"));
-let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000);
-forwarder.expose(target, TunnelId::new("my-app")?).await?;
-# Ok(())
-# }
-```
-
-The `server` feature exposes the corresponding `Server`, `TunnelRegistry`, API router, authenticated identity, hostname-routing, and event types. Applications provide their own listener, authentication middleware, hostname policy, certificates, and event handling.
-
-## Use raw bidirectional connections
-
-The lower-level `client` feature does not depend on forwarding or certificate management. A node registers a session and accepts connection requests from the central server:
-
-```rust,no_run
-use tnl::{TunnelId, client::Client};
-use url::Url;
-
-# async fn node() -> anyhow::Result<()> {
-let client = Client::new(Url::parse("https://tunnel.example.com")?)?
-    .with_authorization("Bearer secret-token")?;
-let mut session = client.register(&TunnelId::new("my-node")?).await?;
-session.wait_until_ready().await?;
+# async fn node<S>(control_stream: S) -> anyhow::Result<()>
+# where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+let mut session = ClientSession::new(control_stream);
+let ready_value = session.wait_until_ready().await?;
+println!("registered as {ready_value}");
 
 loop {
     let request = session.accept().await?;
+    let connection_id = request.into_id();
+
     tokio::spawn(async move {
-        let connection = request.connect().await?;
-        // `connection` implements Tokio AsyncRead + AsyncWrite. Serve gRPC,
-        // another framed protocol, or application-specific traffic over it.
-        drop(connection);
-        Ok::<_, anyhow::Error>(())
+        // Ask the application transport to open its data stream for
+        // `connection_id`, then serve gRPC or another protocol over it.
+        let _ = connection_id;
     });
 }
 # }
 ```
 
-Keep the accept loop running and handle each connection concurrently so the session can continue answering heartbeats.
+Keep accepting while individual connections run concurrently so the session continues answering heartbeats.
 
-On the central side, `TunnelRegistry::connect` requests a matching raw stream from that node. This can be used independently of `Server`; create a plain `TunnelRegistry::new()`, mount `api_router` in an existing authenticated Axum service, and insert a `ClientIdentity` in middleware. Call `TunnelRegistry::shutdown` during graceful shutdown to close registered control sessions and pending connection requests. The returned client and server connection types both implement Tokio `AsyncRead` and `AsyncWrite`, so forwarding is only one possible use. Public hostname forwarding can instead use `TunnelRegistry::with_public_url` to customize the ready value sent to clients. Use `Client::with_tls_config` when nodes need a private CA or mutual TLS.
+### Central side
+
+`Broker<D>` is generic over the application’s data-stream type. The transport adapter registers authenticated control streams and attaches authenticated data streams; application code calls `connect` to initiate a connection to a node.
+
+```rust,no_run
+use tnl::{TunnelId, server::Broker};
+
+# async fn central<Control, Data>(control: Control, data: Data) -> anyhow::Result<()>
+# where
+#     Control: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+#     Data: Send + 'static,
+# {
+let broker = Broker::<Data>::new();
+let node_id = TunnelId::new("node-42")?;
+
+// After authenticating the node's control transport:
+let registration = broker
+    .register(node_id.clone(), "authenticated-principal")
+    .expect("node is already registered");
+tokio::spawn(registration.serve(control));
+
+// After authenticating a data transport and reading its connection ID:
+# let connection_id = "example";
+if let Some(attachment) = broker.claim(connection_id, "authenticated-principal") {
+    let _ = attachment.attach(data);
+}
+
+// From central application code:
+if let Some(stream) = broker.connect(&node_id).await? {
+    // `stream` is the application's original `Data` type. It can carry
+    // bidirectional gRPC, a framed protocol, or arbitrary traffic.
+    drop(stream);
+}
+# Ok(())
+# }
+```
+
+Use `Broker::with_ready_value` when the node needs an application-defined value after registration. Call `Broker::shutdown` during graceful shutdown; registrations and pending connections are then closed and rejected.
+
+The HTTP `CONNECT` implementation used by the CLI is deliberately outside core in `tnlc` and `tnld`.
