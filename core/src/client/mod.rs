@@ -1,50 +1,62 @@
 use std::sync::Arc;
 
-use muxado::{Accept, MuxadoAccept, MuxadoOpen, OpenClose, Session, SessionBuilder};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::Mutex,
 };
 
-use crate::{ConnectionError, Stream};
+use crate::{
+    ConnectionError, SessionConfig, Stream,
+    session::{AcceptStreams, OpenStreams, SessionParts},
+};
 
 /// The node side of a multiplexed tunnel session.
 #[derive(Clone)]
 pub struct ClientSession {
-    opener: MuxadoOpen,
-    accepter: Arc<Mutex<MuxadoAccept>>,
+    inner: Arc<ClientSessionInner>,
+}
+
+struct ClientSessionInner {
+    opener: Arc<Mutex<Box<dyn OpenStreams>>>,
+    accepter: Mutex<Box<dyn AcceptStreams>>,
+    _heartbeat: Option<muxado::heartbeat::HeartbeatCtl>,
 }
 
 impl ClientSession {
-    /// Starts a session over an already-established transport stream.
-    pub fn new<S>(stream: S) -> Self
+    /// Starts a session with heartbeat checks disabled.
+    pub async fn new<S>(stream: S) -> Result<Self, ConnectionError>
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
-        let (opener, accepter) = SessionBuilder::new(stream).client().start().split();
-        Self {
-            opener,
-            accepter: Arc::new(Mutex::new(accepter)),
-        }
+        Self::with_config(stream, SessionConfig::default()).await
     }
 
-    /// Opens a new bidirectional stream to the central server.
+    /// Starts a session with the supplied limits and liveness settings.
+    pub async fn with_config<S>(stream: S, config: SessionConfig) -> Result<Self, ConnectionError>
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let parts = SessionParts::start(stream, true, &config).await?;
+        Ok(Self {
+            inner: Arc::new(ClientSessionInner {
+                opener: parts.opener,
+                accepter: Mutex::new(parts.accepter),
+                _heartbeat: parts._heartbeat,
+            }),
+        })
+    }
+
+    /// Opens a new tagged bidirectional stream to the central server.
     pub async fn open(&self, tag: impl AsRef<str>) -> Result<Stream, ConnectionError> {
         let tag = tag.as_ref().to_owned();
         Stream::validate_tag(&tag)?;
-        let stream = self.opener.clone().open().await?;
+        let stream = self.inner.opener.lock().await.open().await?;
         Stream::outgoing(stream, tag).await
     }
 
     /// Waits for the central server to open the next bidirectional stream.
     pub async fn accept(&self) -> Result<Stream, ConnectionError> {
-        let stream = self
-            .accepter
-            .lock()
-            .await
-            .accept()
-            .await
-            .ok_or(muxado::Error::SessionClosed)?;
+        let stream = self.inner.accepter.lock().await.accept().await?;
         Stream::incoming(stream).await
     }
 }

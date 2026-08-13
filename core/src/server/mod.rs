@@ -3,13 +3,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use muxado::{Accept, OpenClose, SessionBuilder};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, oneshot, watch},
 };
 
-use crate::{ConnectionError, Stream, TunnelId};
+use crate::{ConnectionError, SessionConfig, Stream, TunnelId, session::SessionParts};
 
 struct OpenRequest {
     tag: String,
@@ -18,6 +17,7 @@ struct OpenRequest {
 
 /// Matches registered nodes with multiplexed sessions.
 pub struct Broker {
+    config: SessionConfig,
     state: Arc<Mutex<State>>,
     shutdown: watch::Sender<bool>,
 }
@@ -36,8 +36,13 @@ struct RegisteredSession {
 
 impl Broker {
     pub fn new() -> Self {
+        Self::with_config(SessionConfig::default())
+    }
+
+    pub fn with_config(config: SessionConfig) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
+            config,
             state: Arc::new(Mutex::new(State::default())),
             shutdown,
         }
@@ -125,6 +130,7 @@ impl Broker {
 impl Clone for Broker {
     fn clone(&self) -> Self {
         Self {
+            config: self.config.clone(),
             state: Arc::clone(&self.state),
             shutdown: self.shutdown.clone(),
         }
@@ -179,8 +185,7 @@ impl ServerSession {
             .take()
             .ok_or(muxado::Error::SessionClosed)?;
         let _unregister = UnregisterOnDrop(Arc::clone(&self.inner));
-        let (mut opener, mut accepter) =
-            muxado::Session::split(SessionBuilder::new(stream).server().start());
+        let mut parts = SessionParts::start(stream, false, &self.inner.broker.config).await?;
         let mut shutdown = self.inner.broker.shutdown.subscribe();
 
         loop {
@@ -189,7 +194,7 @@ impl ServerSession {
                     let Some(request) = request else {
                         break;
                     };
-                    let stream = match opener.open().await {
+                    let stream = match parts.opener.lock().await.open().await {
                         Ok(stream) => Stream::outgoing(stream, request.tag).await,
                         Err(error) => Err(error.into()),
                     };
@@ -206,9 +211,11 @@ impl ServerSession {
                         break;
                     }
                 }
-                inbound = accepter.accept() => {
-                    let Some(stream) = inbound else {
-                        break;
+                inbound = parts.accepter.accept() => {
+                    let stream = match inbound {
+                        Ok(stream) => stream,
+                        Err(muxado::Error::SessionClosed | muxado::Error::PeerEOF) => break,
+                        Err(error) => return Err(error.into()),
                     };
                     let inbound_streams = inbound_streams.clone();
                     tokio::spawn(async move {

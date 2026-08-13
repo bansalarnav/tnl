@@ -10,14 +10,17 @@ name = "tnl"
 [features]
 default = []
 client = [
+    "dep:async-trait",
     "dep:muxado",
     "dep:tokio",
 ]
 server = [
+    "dep:async-trait",
     "dep:muxado",
     "dep:tokio",
 ]
 
 [dependencies]
+async-trait = { version = "0.1.89", optional = true }
 muxado = { version = "0.5.4", optional = true }
 tokio = { version = "1.50.0", features = ["io-util", "macros", "rt", "sync"], optional = true }

@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use axum::Router;
 use rustls::ServerConfig;
 use socket2::{SockRef, TcpKeepalive};
-use tnl::{TunnelId, server::Broker};
+use tnl::{SessionConfig, TunnelId, server::Broker};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -31,6 +31,8 @@ use crate::config::Config;
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct ServerState {
     domain: String,
@@ -126,7 +128,8 @@ pub async fn start(background: bool) -> Result<()> {
     let domain = config.domain.trim_end_matches('.').to_ascii_lowercase();
     let wildcard_suffix = format!(".{domain}");
     let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
-    let broker = Broker::new();
+    let broker =
+        Broker::with_config(SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT));
     let api_router = api::router(broker.clone(), domain.clone());
     let state = Arc::new(ServerState {
         wildcard_suffix,

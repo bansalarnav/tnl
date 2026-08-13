@@ -80,11 +80,15 @@ tnl = { package = "tnl-core", path = "core", features = ["client", "server"] }
 Pass an already-established Tokio `AsyncRead + AsyncWrite` stream to `ClientSession`. How that connection is authenticated and transported is application-owned.
 
 ```rust,no_run
-use tnl::client::ClientSession;
+use std::time::Duration;
+use tnl::{client::ClientSession, SessionConfig};
 
 # async fn node<S>(control_stream: S) -> anyhow::Result<()>
 # where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
-let session = ClientSession::new(control_stream);
+let config = SessionConfig::new()
+    .heartbeat(Duration::from_secs(20), Duration::from_secs(60))
+    .max_concurrent_streams(256);
+let session = ClientSession::with_config(control_stream, config).await?;
 
 // Either endpoint can initiate a new independent stream.
 let outgoing = session.open("grpc").await?;
@@ -112,13 +116,17 @@ Keep accepting while individual streams run concurrently. A background task driv
 The transport adapter registers each authenticated node with `Broker`, then runs its `ServerSession` over the established connection. Application code calls `connect` to open a new logical stream to that node; no additional socket or authentication round trip is needed.
 
 ```rust,no_run
-use tnl::{TunnelId, server::Broker};
+use std::time::Duration;
+use tnl::{SessionConfig, TunnelId, server::Broker};
 
 # async fn central<Control>(control: Control) -> anyhow::Result<()>
 # where
 #     Control: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 # {
-let broker = Broker::new();
+let config = SessionConfig::new()
+    .heartbeat(Duration::from_secs(20), Duration::from_secs(60))
+    .max_concurrent_streams(256);
+let broker = Broker::with_config(config);
 let node_id = TunnelId::new("node-42")?;
 
 // After authenticating the node's transport:
@@ -151,5 +159,7 @@ if let Some(stream) = broker.connect(&node_id, "grpc").await? {
 ```
 
 The node is unregistered when its session driver ends or its last `ServerSession` handle is dropped. Call `Broker::shutdown` during graceful shutdown to close all sessions and reject new registrations and streams.
+
+Heartbeat settings must match on both endpoints. Heartbeats are disabled by default; when enabled, a missed deadline closes the multiplexed session. The default maximum is 512 concurrent streams per physical connection.
 
 The HTTP `CONNECT` implementation used by the CLI is deliberately outside core in `tnlc` and `tnld`.

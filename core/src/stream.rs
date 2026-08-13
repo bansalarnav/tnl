@@ -14,7 +14,7 @@ pub const MAX_TAG_LENGTH: usize = u16::MAX as usize;
 /// A tagged bidirectional stream within a session.
 pub struct Stream {
     tag: String,
-    inner: muxado::Stream,
+    inner: muxado::typed::TypedStream,
 }
 
 impl Stream {
@@ -31,7 +31,7 @@ impl Stream {
     }
 
     pub(crate) async fn outgoing(
-        mut inner: muxado::Stream,
+        mut inner: muxado::typed::TypedStream,
         tag: String,
     ) -> Result<Self, SessionError> {
         Self::validate_tag(&tag)?;
@@ -41,7 +41,9 @@ impl Stream {
         Ok(Self { tag, inner })
     }
 
-    pub(crate) async fn incoming(mut inner: muxado::Stream) -> Result<Self, SessionError> {
+    pub(crate) async fn incoming(
+        mut inner: muxado::typed::TypedStream,
+    ) -> Result<Self, SessionError> {
         let mut magic = [0; HEADER_MAGIC.len()];
         inner.read_exact(&mut magic).await?;
         if &magic != HEADER_MAGIC {
@@ -72,7 +74,7 @@ impl AsyncRead for Stream {
         context: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(context, buffer)
+        Pin::new(&mut *self.inner).poll_read(context, buffer)
     }
 }
 
@@ -82,15 +84,15 @@ impl AsyncWrite for Stream {
         context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(context, buffer)
+        Pin::new(&mut *self.inner).poll_write(context, buffer)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(context)
+        Pin::new(&mut *self.inner).poll_flush(context)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(context)
+        Pin::new(&mut *self.inner).poll_shutdown(context)
     }
 }
 
@@ -101,6 +103,8 @@ pub enum SessionError {
     Io(io::Error),
     InvalidStreamHeader,
     InvalidTagEncoding(std::string::FromUtf8Error),
+    InvalidHeartbeatConfig,
+    InvalidStreamLimit,
     TagTooLong(usize),
 }
 
@@ -111,6 +115,11 @@ impl fmt::Display for SessionError {
             Self::Io(error) => error.fmt(formatter),
             Self::InvalidStreamHeader => formatter.write_str("invalid stream header"),
             Self::InvalidTagEncoding(_) => formatter.write_str("stream tag is not valid UTF-8"),
+            Self::InvalidHeartbeatConfig => formatter
+                .write_str("heartbeat interval must be nonzero and shorter than its timeout"),
+            Self::InvalidStreamLimit => {
+                formatter.write_str("maximum concurrent streams must be greater than zero")
+            }
             Self::TagTooLong(length) => write!(
                 formatter,
                 "stream tag is {length} bytes; maximum is {MAX_TAG_LENGTH}"
@@ -125,7 +134,10 @@ impl Error for SessionError {
             Self::Multiplexer(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::InvalidTagEncoding(error) => Some(error),
-            Self::InvalidStreamHeader | Self::TagTooLong(_) => None,
+            Self::InvalidStreamHeader
+            | Self::InvalidHeartbeatConfig
+            | Self::InvalidStreamLimit
+            | Self::TagTooLong(_) => None,
         }
     }
 }

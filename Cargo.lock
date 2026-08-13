@@ -1740,6 +1740,7 @@ dependencies = [
 name = "tnl-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "muxado",
  "tokio",
 ]

@@ -12,7 +12,7 @@ use rand::{Rng, distributions::Alphanumeric};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::ServerName};
 use rustls_acme::{AcmeConfig, EventError, EventOk, caches::DirCache, is_tls_alpn_challenge};
 use socket2::{SockRef, TcpKeepalive};
-use tnl::{TunnelId, client::ClientSession};
+use tnl::{SessionConfig, TunnelId, client::ClientSession};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::TcpStream,
@@ -36,6 +36,8 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const RECONNECT_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 const RECONNECT_JITTER_MAX_MILLIS: u64 = 250;
 const TCP_FORWARD_TAG: &str = "tnl/tcp";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 type ApiStream = TlsStream<TcpStream>;
 
@@ -165,7 +167,11 @@ async fn run_control_session(
         .with_context(|| format!("could not register tunnel {tunnel_id}"))?;
     *has_registered = true;
     let (control_stream, url) = control_stream;
-    let session = ClientSession::new(control_stream);
+    let session = ClientSession::with_config(
+        control_stream,
+        SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT),
+    )
+    .await?;
     let hostname = Url::parse(&url)
         .context("server returned an invalid tunnel URL")?
         .host_str()
