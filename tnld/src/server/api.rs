@@ -10,22 +10,25 @@ use axum::{
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tnl::{TunnelId, server::Broker};
+use tnl::{TunnelId, server::TunnelServer};
 
 use crate::config::Config;
 
 #[derive(Clone)]
 struct ApiState {
-    broker: Broker,
+    tunnel_server: TunnelServer,
     domain: String,
 }
 
-pub fn router(broker: Broker, domain: String) -> Router {
+pub fn router(tunnel_server: TunnelServer, domain: String) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/tunnels/{tunnel_id}", connect(open_tunnel))
         .route_layer(middleware::from_fn(authenticate))
-        .with_state(ApiState { broker, domain })
+        .with_state(ApiState {
+            tunnel_server,
+            domain,
+        })
 }
 
 async fn authenticate(request: Request, next: Next) -> Response {
@@ -60,14 +63,14 @@ async fn open_tunnel(
     Path(tunnel_id): Path<String>,
     mut request: Request<Body>,
 ) -> Response {
-    if state.broker.is_shutdown() {
+    if state.tunnel_server.is_shutdown() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
         return (StatusCode::BAD_REQUEST, "invalid tunnel name").into_response();
     };
-    let Some(session) = state.broker.register(tunnel_id.clone()) else {
-        return if state.broker.is_shutdown() {
+    let Some(tunnel) = state.tunnel_server.register(tunnel_id.clone()) else {
+        return if state.tunnel_server.is_shutdown() {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         } else {
             (StatusCode::CONFLICT, "tunnel name is already in use").into_response()
@@ -79,12 +82,12 @@ async fn open_tunnel(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let on_upgrade = hyper::upgrade::on(&mut request);
-    let shutdown = state.broker.clone();
+    let shutdown = state.tunnel_server.clone();
     tokio::spawn(async move {
         let result = tokio::select! {
             result = async {
                 let upgraded = on_upgrade.await.map_err(anyhow::Error::from)?;
-                session
+                tunnel
                     .serve(TokioIo::new(upgraded))
                     .await
                     .map_err(anyhow::Error::from)

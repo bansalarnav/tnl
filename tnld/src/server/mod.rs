@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use axum::Router;
 use rustls::ServerConfig;
 use socket2::{SockRef, TcpKeepalive};
-use tnl::{SessionConfig, TunnelId, server::Broker};
+use tnl::{SessionConfig, TunnelId, server::TunnelServer};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -40,7 +40,7 @@ struct ServerState {
     api_tls_config: Arc<ServerConfig>,
     acme_tls_config: Arc<ServerConfig>,
     api_router: Router,
-    broker: Broker,
+    tunnel_server: TunnelServer,
 }
 
 fn state_directory() -> Result<PathBuf> {
@@ -128,16 +128,16 @@ pub async fn start(background: bool) -> Result<()> {
     let domain = config.domain.trim_end_matches('.').to_ascii_lowercase();
     let wildcard_suffix = format!(".{domain}");
     let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
-    let broker =
-        Broker::with_config(SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT));
-    let api_router = api::router(broker.clone(), domain.clone());
+    let tunnel_server =
+        TunnelServer::new(SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT));
+    let api_router = api::router(tunnel_server.clone(), domain.clone());
     let state = Arc::new(ServerState {
         wildcard_suffix,
         domain,
         api_tls_config: tls_configs.api,
         acme_tls_config: tls_configs.acme_challenge,
         api_router,
-        broker: broker.clone(),
+        tunnel_server: tunnel_server.clone(),
     });
 
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.listen_port);
@@ -146,13 +146,13 @@ pub async fn start(background: bool) -> Result<()> {
         .with_context(|| format!("could not listen on {address}"))?;
     println!("Server listening on {address}");
 
-    struct ShutdownOnDrop(Broker);
+    struct ShutdownOnDrop(TunnelServer);
     impl Drop for ShutdownOnDrop {
         fn drop(&mut self) {
             self.0.shutdown();
         }
     }
-    let _shutdown = ShutdownOnDrop(broker);
+    let _shutdown = ShutdownOnDrop(tunnel_server);
     let mut connections = JoinSet::new();
     loop {
         let (stream, peer_address) = listener.accept().await?;
@@ -203,7 +203,7 @@ async fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()>
     let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
         return Ok(());
     };
-    tunnel::forward(&state.broker, &tunnel_id, connection).await
+    tunnel::forward(&state.tunnel_server, &tunnel_id, connection).await
 }
 
 fn configure_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {

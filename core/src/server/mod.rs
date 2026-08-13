@@ -16,14 +16,14 @@ struct OpenRequest {
 }
 
 /// Matches registered nodes with multiplexed sessions.
-pub struct Broker {
+pub struct TunnelServer {
     config: SessionConfig,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<TunnelRegistry>>,
     shutdown: watch::Sender<bool>,
 }
 
 #[derive(Default)]
-struct State {
+struct TunnelRegistry {
     shutdown: bool,
     next_session_id: u64,
     sessions: HashMap<String, RegisteredSession>,
@@ -34,23 +34,19 @@ struct RegisteredSession {
     opener: mpsc::Sender<OpenRequest>,
 }
 
-impl Broker {
-    pub fn new() -> Self {
-        Self::with_config(SessionConfig::default())
-    }
-
-    pub fn with_config(config: SessionConfig) -> Self {
+impl TunnelServer {
+    pub fn new(config: SessionConfig) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
             config,
-            state: Arc::new(Mutex::new(State::default())),
+            state: Arc::new(Mutex::new(TunnelRegistry::default())),
             shutdown,
         }
     }
 
     /// Registers a node after the application has authenticated it.
-    pub fn register(&self, tunnel_id: TunnelId) -> Option<ServerSession> {
-        let mut state = self.state.lock().expect("broker lock was poisoned");
+    pub fn register(&self, tunnel_id: TunnelId) -> Option<RegisteredTunnel> {
+        let mut state = self.state.lock().expect("server lock was poisoned");
         if state.shutdown || state.sessions.contains_key(tunnel_id.as_str()) {
             return None;
         }
@@ -67,9 +63,9 @@ impl Broker {
             },
         );
 
-        Some(ServerSession {
-            inner: Arc::new(ServerSessionInner {
-                broker: self.clone(),
+        Some(RegisteredTunnel {
+            inner: Arc::new(RegisteredTunnelInner {
+                server: self.clone(),
                 tunnel_id,
                 session_id,
                 opener,
@@ -81,13 +77,13 @@ impl Broker {
     }
 
     /// Opens a tagged bidirectional stream to a registered node.
-    pub async fn connect(
+    pub async fn open(
         &self,
         tunnel_id: &TunnelId,
         tag: impl AsRef<str>,
     ) -> Result<Option<Stream>, ConnectionError> {
         let opener = {
-            let state = self.state.lock().expect("broker lock was poisoned");
+            let state = self.state.lock().expect("server lock was poisoned");
             if state.shutdown {
                 return Err(muxado::Error::SessionClosed.into());
             }
@@ -102,7 +98,7 @@ impl Broker {
 
     /// Closes all registered sessions.
     pub fn shutdown(&self) {
-        let mut state = self.state.lock().expect("broker lock was poisoned");
+        let mut state = self.state.lock().expect("server lock was poisoned");
         state.shutdown = true;
         state.sessions.clear();
         drop(state);
@@ -112,7 +108,7 @@ impl Broker {
     pub fn is_shutdown(&self) -> bool {
         self.state
             .lock()
-            .expect("broker lock was poisoned")
+            .expect("server lock was poisoned")
             .shutdown
     }
 
@@ -127,7 +123,7 @@ impl Broker {
     }
 }
 
-impl Clone for Broker {
+impl Clone for TunnelServer {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -137,20 +133,20 @@ impl Clone for Broker {
     }
 }
 
-impl Default for Broker {
+impl Default for TunnelServer {
     fn default() -> Self {
-        Self::new()
+        Self::new(SessionConfig::default())
     }
 }
 
 /// The central-server side of a registered multiplexed tunnel session.
 #[derive(Clone)]
-pub struct ServerSession {
-    inner: Arc<ServerSessionInner>,
+pub struct RegisteredTunnel {
+    inner: Arc<RegisteredTunnelInner>,
 }
 
-struct ServerSessionInner {
-    broker: Broker,
+struct RegisteredTunnelInner {
+    server: TunnelServer,
     tunnel_id: TunnelId,
     session_id: u64,
     opener: mpsc::Sender<OpenRequest>,
@@ -160,9 +156,9 @@ struct ServerSessionInner {
     inbound_sender: Mutex<Option<mpsc::UnboundedSender<Result<Stream, ConnectionError>>>>,
 }
 
-struct UnregisterOnDrop(Arc<ServerSessionInner>);
+struct UnregisterOnDrop(Arc<RegisteredTunnelInner>);
 
-impl ServerSession {
+impl RegisteredTunnel {
     /// Runs the session over an already-established transport stream.
     ///
     /// This may be called only once for a registered session.
@@ -185,8 +181,8 @@ impl ServerSession {
             .take()
             .ok_or(muxado::Error::SessionClosed)?;
         let _unregister = UnregisterOnDrop(Arc::clone(&self.inner));
-        let mut parts = SessionParts::start(stream, false, &self.inner.broker.config).await?;
-        let mut shutdown = self.inner.broker.shutdown.subscribe();
+        let mut parts = SessionParts::start(stream, false, &self.inner.server.config).await?;
+        let mut shutdown = self.inner.server.shutdown.subscribe();
 
         loop {
             tokio::select! {
@@ -251,15 +247,15 @@ impl ServerSession {
     }
 }
 
-impl Drop for ServerSessionInner {
+impl Drop for RegisteredTunnelInner {
     fn drop(&mut self) {
         self.unregister();
     }
 }
 
-impl ServerSessionInner {
+impl RegisteredTunnelInner {
     fn unregister(&self) {
-        let mut state = self.broker.state.lock().expect("broker lock was poisoned");
+        let mut state = self.server.state.lock().expect("server lock was poisoned");
         if state
             .sessions
             .get(self.tunnel_id.as_str())

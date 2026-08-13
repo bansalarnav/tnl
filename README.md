@@ -77,27 +77,27 @@ tnl = { package = "tnl-core", path = "core", features = ["client", "server"] }
 
 ### Node side
 
-Pass an already-established Tokio `AsyncRead + AsyncWrite` stream to `ClientSession`. How that connection is authenticated and transported is application-owned.
+Pass an already-established Tokio `AsyncRead + AsyncWrite` stream to `TunnelClient`. How that connection is authenticated and transported is application-owned.
 
 ```rust,no_run
 use std::time::Duration;
-use tnl::{client::ClientSession, SessionConfig};
+use tnl::{client::TunnelClient, SessionConfig};
 
 # async fn node<S>(control_stream: S) -> anyhow::Result<()>
 # where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
 let config = SessionConfig::new()
     .heartbeat(Duration::from_secs(20), Duration::from_secs(60))
     .max_concurrent_streams(256);
-let session = ClientSession::with_config(control_stream, config).await?;
+let client = TunnelClient::new(control_stream, config).await?;
 
 // Either endpoint can initiate a new independent stream.
-let outgoing = session.open("grpc").await?;
+let outgoing = client.open("grpc").await?;
 tokio::spawn(async move {
     drop(outgoing);
 });
 
 loop {
-    let stream = session.accept().await?;
+    let stream = client.accept().await?;
     println!("incoming protocol: {:?}", stream.tag());
 
     tokio::spawn(async move {
@@ -109,15 +109,15 @@ loop {
 # }
 ```
 
-Keep accepting while individual streams run concurrently. A background task drives the multiplexed connection, so cloned session handles may call `open` and `accept` concurrently.
+Keep accepting while individual streams run concurrently. A background task drives the multiplexed connection, so cloned client handles may call `open` and `accept` concurrently.
 
 ### Central side
 
-The transport adapter registers each authenticated node with `Broker`, then runs its `ServerSession` over the established connection. Application code calls `connect` to open a new logical stream to that node; no additional socket or authentication round trip is needed.
+The transport adapter registers each authenticated node with `TunnelServer`, then runs its `RegisteredTunnel` over the established connection. Application code calls `open` to create a new logical stream to that node; no additional socket or authentication round trip is needed.
 
 ```rust,no_run
 use std::time::Duration;
-use tnl::{SessionConfig, TunnelId, server::Broker};
+use tnl::{SessionConfig, TunnelId, server::TunnelServer};
 
 # async fn central<Control>(control: Control) -> anyhow::Result<()>
 # where
@@ -126,19 +126,19 @@ use tnl::{SessionConfig, TunnelId, server::Broker};
 let config = SessionConfig::new()
     .heartbeat(Duration::from_secs(20), Duration::from_secs(60))
     .max_concurrent_streams(256);
-let broker = Broker::with_config(config);
+let server = TunnelServer::new(config);
 let node_id = TunnelId::new("node-42")?;
 
 // After authenticating the node's transport:
-let session = broker
+let tunnel = server
     .register(node_id.clone())
     .expect("node is already registered");
-tokio::spawn(session.clone().serve(control));
+tokio::spawn(tunnel.clone().serve(control));
 
-// Node-initiated streams are accepted from the same session handle.
-let incoming_session = session.clone();
+// Node-initiated streams are accepted from the same registered tunnel handle.
+let incoming_tunnel = tunnel.clone();
 tokio::spawn(async move {
-    let incoming = incoming_session.accept().await?;
+    let incoming = incoming_tunnel.accept().await?;
     match incoming.tag() {
         "grpc" => { /* serve gRPC over `incoming` */ }
         "files" => { /* receive a file */ }
@@ -149,7 +149,7 @@ tokio::spawn(async move {
 });
 
 // From central application code:
-if let Some(stream) = broker.connect(&node_id, "grpc").await? {
+if let Some(stream) = server.open(&node_id, "grpc").await? {
     // `stream` implements Tokio AsyncRead + AsyncWrite and is independent
     // of every other logical stream in the same session.
     drop(stream);
@@ -158,7 +158,7 @@ if let Some(stream) = broker.connect(&node_id, "grpc").await? {
 # }
 ```
 
-The node is unregistered when its session driver ends or its last `ServerSession` handle is dropped. Call `Broker::shutdown` during graceful shutdown to close all sessions and reject new registrations and streams.
+The node is unregistered when its session driver ends or its last `RegisteredTunnel` handle is dropped. Call `TunnelServer::shutdown` during graceful shutdown to close all sessions and reject new registrations and streams.
 
 Heartbeat settings must match on both endpoints. Heartbeats are disabled by default; when enabled, a missed deadline closes the multiplexed session. The default maximum is 512 concurrent streams per physical connection.
 

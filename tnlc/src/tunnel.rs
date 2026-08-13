@@ -12,7 +12,7 @@ use rand::{Rng, distributions::Alphanumeric};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::ServerName};
 use rustls_acme::{AcmeConfig, EventError, EventOk, caches::DirCache, is_tls_alpn_challenge};
 use socket2::{SockRef, TcpKeepalive};
-use tnl::{SessionConfig, TunnelId, client::ClientSession};
+use tnl::{SessionConfig, TunnelId, client::TunnelClient};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::TcpStream,
@@ -167,7 +167,7 @@ async fn run_control_session(
         .with_context(|| format!("could not register tunnel {tunnel_id}"))?;
     *has_registered = true;
     let (control_stream, url) = control_stream;
-    let session = ClientSession::with_config(
+    let client = TunnelClient::new(
         control_stream,
         SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT),
     )
@@ -198,7 +198,7 @@ async fn run_control_session(
     }
 
     loop {
-        let tunnel_stream = session.accept().await?;
+        let tunnel_stream = client.accept().await?;
         if tunnel_stream.tag() != TCP_FORWARD_TAG {
             eprintln!("ignoring unsupported stream tag: {}", tunnel_stream.tag());
             continue;
