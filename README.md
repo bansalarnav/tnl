@@ -32,14 +32,15 @@ cargo install --git https://github.com/bansalarnav/tnl tnld
 
 ### 1. Set up the public server
 
-The server needs a public IP address and TCP port 443 open. Install tnl on the server, then run:
+The server needs Linux with systemd, a public IP address, and TCP port 443 open. Run the installer as the non-root user that should own the configuration:
 
 ```sh
-tnld setup
-tnld start --background
+curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | sh -s -- --server
 ```
 
-Setup detects the server's public IP and defaults to a free `nip.io` domain. If you use your own domain, add the DNS records printed by the command. Certificate issuance requires public TCP port 443 to reach the configured listen port.
+The installer places the binaries in `/usr/local/bin`, runs the interactive server setup, and starts `tnld` through systemd. The service runs as your user with only the capability required to bind port 443. The installer asks for `sudo` while installing and starting the service, but the daemon itself does not run as root. When running the installer as root, pass an existing non-root account with `--service-user <user>`.
+
+Setup detects the server's public IP and defaults to a free `nip.io` domain. If you use your own domain, add the DNS records printed by the command. Certificate issuance requires public TCP port 443 to reach the configured listen port. Re-running the server installer upgrades the binaries and restarts the configured service.
 
 Create credentials for a client:
 
@@ -71,10 +72,13 @@ The client prints the public HTTPS URL once it is ready. To request a memorable 
 tnlc expose 3000 --name my-app
 ```
 
-Keep this command running while the tunnel is in use. To stop a background server later, run:
+Keep this command running while the tunnel is in use. Manage the server with systemd:
 
 ```sh
-tnld stop
+sudo systemctl status tnld.service
+sudo systemctl restart tnld.service
+sudo systemctl stop tnld.service
+sudo journalctl -u tnld.service -f
 ```
 
 ## Project structure
