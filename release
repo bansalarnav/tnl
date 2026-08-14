@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$repo_root"
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: ./release <version>" >&2
+  echo "Example: ./release 0.2.0" >&2
+  exit 1
+fi
+
+version="${1#v}"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+  echo "Version must be semantic, for example 0.2.0 or 0.2.0-rc.1." >&2
+  exit 1
+fi
+
+for command in cargo gh git python3; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "$command is required to release." >&2
+    exit 1
+  fi
+done
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "The working tree must be clean before releasing." >&2
+  exit 1
+fi
+
+branch="$(git branch --show-current)"
+if [[ "$branch" != "main" ]]; then
+  echo "Releases must be run from main, not $branch." >&2
+  exit 1
+fi
+
+gh auth status >/dev/null
+
+git fetch origin main
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+  echo "Local main must match origin/main before releasing." >&2
+  exit 1
+fi
+
+tag="v$version"
+if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null || \
+  git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+  echo "$tag already exists." >&2
+  exit 1
+fi
+
+VERSION="$version" python3 - <<'PY'
+import os
+import pathlib
+import re
+
+path = pathlib.Path("Cargo.toml")
+contents = path.read_text()
+updated, replacements = re.subn(
+    r'(?m)^(version = ")[^"]+("\s*)$',
+    rf'\g<1>{os.environ["VERSION"]}\g<2>',
+    contents,
+)
+if replacements != 1:
+    raise SystemExit("Expected one workspace version in Cargo.toml")
+path.write_text(updated)
+PY
+
+cargo metadata --no-deps --format-version 1 >/dev/null
+VERSION="$version" cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+import json
+import os
+import sys
+
+packages = {package["name"]: package["version"] for package in json.load(sys.stdin)["packages"]}
+expected = os.environ["VERSION"]
+for name in ("tnl-core", "tnlc", "tnld"):
+    if packages.get(name) != expected:
+        raise SystemExit(f"{name} version is {packages.get(name)}, expected {expected}")
+'
+
+git add -- Cargo.toml Cargo.lock
+if ! git diff --cached --quiet; then
+  git commit --message "Release $tag"
+fi
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Unexpected files changed while updating the release version." >&2
+  exit 1
+fi
+
+git push origin main
+head="$(git rev-parse HEAD)"
+
+release_is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || true)"
+if [[ "$release_is_draft" == "false" ]]; then
+  echo "GitHub release $tag already exists." >&2
+  exit 1
+fi
+
+if [[ "$release_is_draft" != "true" ]]; then
+  release_args=(
+    "$tag"
+    --draft
+    --generate-notes
+    --target "$head"
+    --title "$tag"
+  )
+  if [[ "$version" == *-* ]]; then
+    release_args+=(--prerelease)
+  fi
+  gh release create "${release_args[@]}"
+fi
+
+started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+gh workflow run release.yml --ref main --field "tag=$tag"
+
+run_id=""
+for _ in {1..30}; do
+  run_id="$(
+    gh run list \
+      --workflow release.yml \
+      --event workflow_dispatch \
+      --limit 30 \
+      --json createdAt,databaseId,displayTitle \
+      --jq ".[] | select(.displayTitle == \"$tag\" and .createdAt >= \"$started_at\") | .databaseId" \
+      | head -n 1
+  )"
+  if [[ -n "$run_id" ]]; then
+    break
+  fi
+  sleep 2
+done
+
+if [[ -z "$run_id" ]]; then
+  echo "The release workflow was dispatched, but its run could not be located." >&2
+  exit 1
+fi
+
+echo "Watching release workflow run $run_id"
+gh run watch "$run_id" --exit-status

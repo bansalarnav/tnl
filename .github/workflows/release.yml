@@ -1,0 +1,224 @@
+name: Release
+
+run-name: ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag (for example, v0.1.0)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Require main branch
+        if: ${{ github.ref_name != 'main' }}
+        run: |
+          echo "Releases must run from main, not ${GITHUB_REF_NAME}."
+          exit 1
+
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate version
+        id: version
+        env:
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          if [[ ! "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "${TAG_NAME} is not a supported semantic version tag."
+            exit 1
+          fi
+
+          VERSION="${TAG_NAME#v}"
+          VERSIONS_MATCH=$(cargo metadata --locked --no-deps --format-version 1 | jq \
+            --arg version "${VERSION}" \
+            '[.packages[] | select(.name == "tnl-core" or .name == "tnlc" or .name == "tnld") | .version] as $versions | ($versions | length == 3) and ($versions | all(. == $version))')
+
+          if [[ "${VERSIONS_MATCH}" != "true" ]]; then
+            echo "Release ${VERSION} must match the version of tnl-core, tnlc, and tnld."
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate and pin draft release
+        id: draft
+        uses: actions/github-script@v8
+        env:
+          TAG_NAME: ${{ inputs.tag }}
+        with:
+          script: |
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const release = releases.find(({ tag_name }) => tag_name === process.env.TAG_NAME);
+
+            if (!release) {
+              core.setFailed(`Create a draft release for ${process.env.TAG_NAME} first.`);
+              return;
+            }
+            if (!release.draft) {
+              core.setFailed(`Release ${process.env.TAG_NAME} must still be a draft.`);
+              return;
+            }
+            if (!release.body?.trim()) {
+              core.setFailed(`Draft release ${process.env.TAG_NAME} must contain release notes.`);
+              return;
+            }
+
+            const shouldBePrerelease = process.env.TAG_NAME.includes('-');
+            if (release.prerelease !== shouldBePrerelease) {
+              core.setFailed(`Draft prerelease setting does not match tag ${process.env.TAG_NAME}.`);
+              return;
+            }
+
+            try {
+              await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${process.env.TAG_NAME}`,
+              });
+              core.setFailed(`Git tag ${process.env.TAG_NAME} already exists.`);
+              return;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.id,
+              tag_name: process.env.TAG_NAME,
+              target_commitish: context.sha,
+            });
+            core.setOutput('release_id', release.id);
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            asset: linux-x86_64
+          - runner: ubuntu-22.04-arm
+            asset: linux-aarch64
+          - runner: macos-15-intel
+            asset: macos-x86_64
+          - runner: macos-15
+            asset: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Build binaries
+        run: cargo build --locked --release -p tnlc -p tnld
+
+      - name: Package binaries
+        env:
+          ASSET: ${{ matrix.asset }}
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          ARCHIVE="tnl-${TAG_NAME}-${ASSET}"
+          mkdir "${ARCHIVE}"
+          cp target/release/tnlc target/release/tnld "${ARCHIVE}/"
+          tar -czf "${ARCHIVE}.tar.gz" "${ARCHIVE}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.asset }}
+          path: tnl-${{ inputs.tag }}-${{ matrix.asset }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: release-assets
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ inputs.tag }}
+        run: gh release upload "${TAG_NAME}" release-assets/* --clobber --repo "${GITHUB_REPOSITORY}"
+
+      - name: Publish reviewed draft release
+        uses: actions/github-script@v8
+        env:
+          RELEASE_ID: ${{ needs.validate.outputs.release_id }}
+          TAG_NAME: ${{ inputs.tag }}
+        with:
+          script: |
+            const releaseId = Number(process.env.RELEASE_ID);
+            const { data: release } = await github.rest.repos.getRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+            });
+
+            if (release.tag_name !== process.env.TAG_NAME || !release.draft) {
+              core.setFailed(`Draft release ${process.env.TAG_NAME} changed while the binaries were building.`);
+              return;
+            }
+            if (!release.body?.trim()) {
+              core.setFailed(`Draft release ${process.env.TAG_NAME} no longer contains release notes.`);
+              return;
+            }
+            if (release.target_commitish !== context.sha) {
+              core.setFailed(`Draft release ${process.env.TAG_NAME} no longer targets ${context.sha}.`);
+              return;
+            }
+
+            try {
+              await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${process.env.TAG_NAME}`,
+              });
+              core.setFailed(`Git tag ${process.env.TAG_NAME} was created while the binaries were building.`);
+              return;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+              tag_name: process.env.TAG_NAME,
+              target_commitish: context.sha,
+              draft: false,
+            });
