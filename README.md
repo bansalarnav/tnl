@@ -18,7 +18,7 @@ The workspace contains three packages:
 - A public server with TCP port 443 open
 - A local HTTP service to expose
 
-Prebuilt `tnlc` and `tnld` binaries for Linux and macOS are also available from the [GitHub releases](https://github.com/bansalarnav/tunnel/releases) page.
+Prebuilt `tnlc` and `tnld` binaries for Linux and macOS are also available from the [GitHub releases](https://github.com/bansalarnav/tnl/releases) page.
 
 ## 1. Set up the public server
 
