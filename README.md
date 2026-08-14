@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | s
 
 Server:
 ```sh
-curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | sh --server
+curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | sh -- --server
 ```
 
 ### Build from source
