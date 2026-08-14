@@ -67,7 +67,7 @@ if replacements != 1:
 path.write_text(updated)
 PY
 
-cargo metadata --no-deps --format-version 1 >/dev/null
+cargo check -p tnlc -p tnld
 cargo metadata --locked --no-deps --format-version 1 | VERSION="$version" python3 -c '
 import json
 import os
