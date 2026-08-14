@@ -1,32 +1,42 @@
-Currently AI slop, read with caution
-
---------
-
 # tnl
 
 Expose a local HTTP service through your own public `tnld` server. The public endpoint uses HTTPS.
 
-The workspace contains three packages:
+## Installation
 
-- `tnl-core` in `core/` (imported as `tnl`): transport-neutral tunnel sessions and connection pairing
-- `tnlc`: the command-line client, including HTTPS transport, ACME, and local forwarding
-- `tnld`: the command-line server, including authentication, HTTP upgrades, TLS, SNI routing, and public forwarding
-
-## Requirements
-
-- Rust and Cargo
-- A public server with TCP port 443 open
-- A local HTTP service to expose
-
-Prebuilt `tnlc` and `tnld` binaries for Linux and macOS are also available from the [GitHub releases](https://github.com/bansalarnav/tnl/releases) page.
-
-## 1. Set up the public server
-
-Clone this repository on the server, then run:
+Install the latest release on Linux or macOS:
 
 ```sh
-cargo run --release -p tnld -- setup
-cargo run --release -p tnld -- start --background
+curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | sh
+```
+
+The installer detects the operating system and processor, verifies the release checksum, and installs `tnlc` and `tnld`. Linux users install into `~/.local/bin`. On macOS, the installer uses `/usr/local/bin` when it is already writable and otherwise uses `~/.local/bin`. When run as root, it installs into `/usr/local/bin`. If the selected directory is not in `PATH`, the installer adds it to the appropriate shell startup file.
+
+Restart the shell after the first installation if the installer updated `PATH`. Run the same command again later to upgrade. Options can be passed through `sh` to install a specific release or choose a different directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | sh -s -- --version 0.0.1
+curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | sh -s -- --install-dir /custom/bin --no-modify-path
+```
+
+### Build from source
+
+Rust users can install either package directly from GitHub:
+
+```sh
+cargo install --git https://github.com/bansalarnav/tnl tnlc
+cargo install --git https://github.com/bansalarnav/tnl tnld
+```
+
+## Setup
+
+### 1. Set up the public server
+
+The server needs a public IP address and TCP port 443 open. Install tnl on the server, then run:
+
+```sh
+tnld setup
+tnld start --background
 ```
 
 Setup detects the server's public IP and defaults to a free `nip.io` domain. If you use your own domain, add the DNS records printed by the command. Certificate issuance requires public TCP port 443 to reach the configured listen port.
@@ -34,38 +44,46 @@ Setup detects the server's public IP and defaults to a free `nip.io` domain. If 
 Create credentials for a client:
 
 ```sh
-cargo run --release -p tnld -- invite-client my-laptop
+tnld invite-client my-laptop
 ```
 
 Copy the `tnl-login-v1...` value it prints.
 
-## 2. Log in from your local machine
+### 2. Set up the local client
 
-Clone this repository locally and run:
+Install tnl on the local machine, then log in with the invitation from the server:
 
 ```sh
-cargo run --release -p tnlc -- login 'tnl-login-v1...'
+tnlc login 'tnl-login-v1...'
 ```
 
-## 3. Expose a local service
+## Usage
 
-If your app is running on port 3000:
+If the local app is running on port 3000, expose it with:
 
 ```sh
-cargo run --release -p tnlc -- expose 3000
+tnlc expose 3000
 ```
 
 The client prints the public HTTPS URL once it is ready. To request a memorable subdomain, add a name:
 
 ```sh
-cargo run --release -p tnlc -- expose 3000 --name my-app
+tnlc expose 3000 --name my-app
 ```
 
 Keep this command running while the tunnel is in use. To stop a background server later, run:
 
 ```sh
-cargo run --release -p tnld -- stop
+tnld stop
 ```
+
+## Project structure
+
+The workspace contains three packages:
+
+- `tnl-core` in `core/` (imported as `tnl`): transport-neutral tunnel sessions and connection pairing
+- `tnlc`: the command-line client, including HTTPS transport, ACME, and local forwarding
+- `tnld`: the command-line server, including authentication, HTTP upgrades, TLS, SNI routing, and public forwarding
 
 ## Core API
 
