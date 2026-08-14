@@ -37,7 +37,7 @@ fi
 
 gh auth status >/dev/null
 
-git fetch origin main
+git fetch origin main --tags
 if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
   echo "Local main must match origin/main before releasing." >&2
   exit 1
@@ -92,6 +92,26 @@ fi
 
 git push origin main
 head="$(git rev-parse HEAD)"
+repo_url="$(gh repo view --json url --jq .url)"
+previous_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+notes_file="$(mktemp)"
+trap 'rm -f "$notes_file"' EXIT
+
+if [[ -n "$previous_tag" ]]; then
+  commit_range="$previous_tag..$head"
+  full_changelog="$repo_url/compare/$previous_tag...$tag"
+else
+  commit_range="$head"
+  full_changelog="$repo_url/commits/$tag"
+fi
+
+{
+  echo "## Changes"
+  echo
+  git log --format="- %s ([%h]($repo_url/commit/%H))" "$commit_range"
+  echo
+  echo "**Full changelog**: $full_changelog"
+} > "$notes_file"
 
 release_is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || true)"
 if [[ "$release_is_draft" == "false" ]]; then
@@ -103,7 +123,7 @@ if [[ "$release_is_draft" != "true" ]]; then
   release_args=(
     "$tag"
     --draft
-    --generate-notes
+    --notes-file "$notes_file"
     --target "$head"
     --title "$tag"
   )
@@ -111,6 +131,8 @@ if [[ "$release_is_draft" != "true" ]]; then
     release_args+=(--prerelease)
   fi
   gh release create "${release_args[@]}"
+else
+  gh release edit "$tag" --notes-file "$notes_file" --target "$head" --title "$tag"
 fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

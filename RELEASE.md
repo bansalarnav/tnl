@@ -8,7 +8,7 @@ Run the release script from a clean, up-to-date `main` branch:
 
 Prerelease versions such as `./release 0.2.0-rc.1` are also supported.
 
-The script updates the shared Cargo workspace version and lockfile, commits and pushes any version change, creates a draft GitHub release with generated notes, starts the GitHub Actions workflow, and watches it to completion.
+The script updates the shared Cargo workspace version and lockfile, commits and pushes any version change, creates a draft GitHub release with a linked list of every commit since the previous tag, starts the GitHub Actions workflow, and watches it to completion.
 
 The workflow verifies that the tag matches all three Cargo package versions, pins the draft to the selected `main` commit, and builds both `tnlc` and `tnld` for:
 
