@@ -44,5 +44,7 @@ Raw `oha` JSON, `summary.csv`, and `processes.csv` are written below `benchmarks
 
 Recorded optimization studies:
 
+- [Optimization guide](OPTIMIZATIONS.md): conceptual data paths, rationale, code map, and why
+  concurrency-one results differ from aggregate throughput.
 - [First pass](OPTIMIZATION_RESULTS.md): mux buffers, flow-control window, session pooling, and LTO.
 - [Second pass](ROUND2_RESULTS.md): dedicated data transports, adaptive mux fallback, uploads, and the full checkpoint matrix.
