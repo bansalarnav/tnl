@@ -19,6 +19,9 @@ pub mod server;
 
 pub use protocol::TunnelId;
 
+/// HTTP transport protocol version required by this release.
+pub const PROTOCOL_VERSION: &str = "2";
+
 #[cfg(any(feature = "client", feature = "server"))]
 pub use stream::{MAX_TAG_LENGTH, SessionError, Stream};
 

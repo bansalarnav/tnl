@@ -171,9 +171,14 @@ per-byte and per-request work (copies, TLS passes, wakeups, and proxy boundaries
 against a direct baseline with equivalent endpoint TLS. Opening more transports alone cannot
 improve a workload that has only one active connection.
 
-## Compatibility
+## Protocol versioning
 
-Both features are server-advertised. A new client defaults to one control session and no
-dedicated pool if the new headers are absent; an old client ignores the headers and continues to
-use one mux connection. Dedicated transports are authenticated and bound to the registered
+The client and server require `X-Tnl-Protocol-Version: 2` on tunnel and transport CONNECT
+requests and responses. Missing or unsupported versions fail registration instead of silently
+selecting a legacy data path. The server still advertises the required pool sizes; these headers
+are mandatory in protocol v2. Dedicated transports are authenticated and bound to the registered
 tunnel owner before entering the pool.
+
+Mux remains part of protocol v2 because it is the measured fast path for high-churn tiny
+connections and a bounded fallback when replenishment cannot satisfy a burst. It is not retained
+to support old peers.

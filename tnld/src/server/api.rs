@@ -11,11 +11,13 @@ use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tnl::{
-    TunnelId,
+    PROTOCOL_VERSION, TunnelId,
     server::{MAX_SESSIONS_PER_TUNNEL, RECOMMENDED_IDLE_TRANSPORTS_PER_TUNNEL, TunnelServer},
 };
 
 use crate::config::Config;
+
+const PROTOCOL_VERSION_HEADER: &str = "X-Tnl-Protocol-Version";
 
 #[derive(Clone)]
 struct ApiState {
@@ -81,6 +83,13 @@ async fn open_tunnel(
     let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
         return (StatusCode::BAD_REQUEST, "invalid tunnel name").into_response();
     };
+    if !protocol_version_supported(&request) {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "unsupported or missing tunnel protocol version",
+        )
+            .into_response();
+    }
     let url = format!("https://{tunnel_id}.{}", state.domain);
     let Ok(url) = HeaderValue::from_str(&url) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -111,12 +120,14 @@ async fn open_tunnel(
         .expect("control session limit is a valid header value");
     let transport_pool = HeaderValue::from_str(&RECOMMENDED_IDLE_TRANSPORTS_PER_TUNNEL.to_string())
         .expect("transport pool limit is a valid header value");
+    let protocol_version = HeaderValue::from_static(PROTOCOL_VERSION);
     (
         StatusCode::OK,
         [
             ("X-Tnl-Url", url),
             ("X-Tnl-Control-Sessions", control_sessions),
             ("X-Tnl-Transport-Pool", transport_pool),
+            (PROTOCOL_VERSION_HEADER, protocol_version),
         ],
     )
         .into_response()
@@ -134,6 +145,13 @@ async fn open_transport(
     let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
         return (StatusCode::BAD_REQUEST, "invalid tunnel name").into_response();
     };
+    if !protocol_version_supported(&request) {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "unsupported or missing tunnel protocol version",
+        )
+            .into_response();
+    }
 
     let on_upgrade = hyper::upgrade::on(&mut request);
     let tunnel_server = state.tunnel_server.clone();
@@ -150,9 +168,45 @@ async fn open_transport(
         }
     });
 
-    StatusCode::OK.into_response()
+    (
+        StatusCode::OK,
+        [(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)],
+    )
+        .into_response()
+}
+
+fn protocol_version_supported(request: &Request<Body>) -> bool {
+    request
+        .headers()
+        .get(PROTOCOL_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(PROTOCOL_VERSION)
 }
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::Body, extract::Request};
+
+    use super::{PROTOCOL_VERSION_HEADER, protocol_version_supported};
+
+    #[test]
+    fn rejects_missing_or_old_protocol_versions() {
+        let current = Request::builder()
+            .header(PROTOCOL_VERSION_HEADER, "2")
+            .body(Body::empty())
+            .unwrap();
+        let old = Request::builder()
+            .header(PROTOCOL_VERSION_HEADER, "1")
+            .body(Body::empty())
+            .unwrap();
+        let missing = Request::new(Body::empty());
+
+        assert!(protocol_version_supported(&current));
+        assert!(!protocol_version_supported(&old));
+        assert!(!protocol_version_supported(&missing));
+    }
 }

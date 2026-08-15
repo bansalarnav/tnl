@@ -51,7 +51,8 @@ The mux window and session pooling also complement each other. A larger window k
 - Enable `TCP_NODELAY` for accepted `tnld` sockets and the `tnlc` control sockets.
 - Pool up to eight control sessions per tunnel and assign visitor streams round-robin.
 - Bind pooled sessions to the same authenticated client credential.
-- Negotiate the supported pool size in `X-Tnl-Control-Sessions`; clients default to one when talking to an older server.
+- Negotiate the supported pool size in `X-Tnl-Control-Sessions`. The subsequent protocol-v2 pass
+  made this capability header mandatory rather than defaulting for older servers.
 - Build release binaries with thin LTO and one codegen unit.
 
 Raw experiment output is stored in `/tmp/tnl-opt-*` on the benchmark host. The reusable harness is in this directory.

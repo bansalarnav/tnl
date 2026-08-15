@@ -48,7 +48,7 @@ per-frame allocation, copying, flow-control, and scheduling cost of one stream.
 The selected design separates control and data planes. `tnlc` keeps authenticated outer-TLS
 data transports ready; `tnld` assigns one transport to a visitor connection and sends a core
 activation marker. Application bytes then bypass muxado entirely. The mux session remains the
-backward-compatible fallback and is preferred automatically for high-churn tiny connections.
+adaptive fallback and is preferred automatically for high-churn tiny connections.
 
 This follows patterns used by established tunnel implementations:
 
@@ -79,8 +79,9 @@ most of the aggregate gain without changing byte-stream semantics.
   control and visitor sockets.
 - Prefer TLS 1.3 AES-128-GCM for the outer tunnel transport. Endpoint TLS configuration is
   unchanged.
-- Negotiate the transport pool using `X-Tnl-Transport-Pool`. New clients use no dedicated pool
-  with old servers; old clients ignore the new header and continue using mux streams.
+- Require protocol v2 explicitly on tunnel and transport CONNECT requests and responses. Protocol
+  v2 requires the `X-Tnl-Control-Sessions` and `X-Tnl-Transport-Pool` capability headers rather
+  than silently selecting a legacy data path when either is absent.
 
 ## Experiments and interactions
 

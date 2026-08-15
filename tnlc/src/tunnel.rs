@@ -16,7 +16,9 @@ use rustls::{
 };
 use rustls_acme::{AcmeConfig, EventError, EventOk, caches::DirCache, is_tls_alpn_challenge};
 use socket2::{SockRef, TcpKeepalive};
-use tnl::{SessionConfig, TRANSPORT_ACTIVATION_MARKER, TunnelId, client::TunnelClient};
+use tnl::{
+    PROTOCOL_VERSION, SessionConfig, TRANSPORT_ACTIVATION_MARKER, TunnelId, client::TunnelClient,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
     net::TcpStream,
@@ -31,6 +33,7 @@ use url::{Host, Url};
 use crate::config;
 
 const MAX_HTTP_RESPONSE_HEADER_LENGTH: usize = 16 * 1024;
+const PROTOCOL_VERSION_HEADER: &str = "X-Tnl-Protocol-Version";
 const ACME_ORDER_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -478,18 +481,16 @@ impl HttpTransport {
             .filter(|value| !value.is_empty())
             .context("tunnel server response did not include X-Tnl-Url")?;
 
-        let control_session_count = header_count(
+        let control_session_count = required_header_count(
             &response_header,
             "x-tnl-control-sessions",
             MAX_CONTROL_SESSION_COUNT,
-        )
-        .unwrap_or(1);
-        let transport_pool_size = header_count(
+        )?;
+        let transport_pool_size = required_header_count(
             &response_header,
             "x-tnl-transport-pool",
             MAX_TRANSPORT_POOL_SIZE,
-        )
-        .unwrap_or(0);
+        )?;
 
         Ok(TunnelRegistration {
             stream,
@@ -542,8 +543,8 @@ impl HttpTransport {
             _ => format!("{host}:{port}"),
         };
         let request = format!(
-            "CONNECT {path} HTTP/1.1\r\nHost: {host_header}\r\nAuthorization: {}\r\n\r\n",
-            self.authorization,
+            "CONNECT {path} HTTP/1.1\r\nHost: {host_header}\r\nAuthorization: {}\r\n{PROTOCOL_VERSION_HEADER}: {PROTOCOL_VERSION}\r\n\r\n",
+            self.authorization
         );
         stream.write_all(request.as_bytes()).await?;
 
@@ -564,18 +565,38 @@ impl HttpTransport {
             }
             .into());
         }
+        validate_protocol_version(&response_header)?;
 
         Ok((stream, response_header))
     }
 }
 
-fn header_count(header: &str, name: &str, maximum: usize) -> Option<usize> {
+fn header_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
     header
         .lines()
         .filter_map(|line| line.split_once(':'))
         .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .map(|(_, value)| value.trim())
+}
+
+fn required_header_count(header: &str, name: &str, maximum: usize) -> Result<usize> {
+    header_value(header, name)
+        .with_context(|| format!("tunnel server response did not include {name}"))?
+        .parse::<usize>()
+        .ok()
         .filter(|count| (1..=maximum).contains(count))
+        .with_context(|| format!("tunnel server returned an invalid {name}"))
+}
+
+fn validate_protocol_version(header: &str) -> Result<()> {
+    let protocol_version = header_value(header, PROTOCOL_VERSION_HEADER)
+        .context("tunnel server did not declare its protocol version")?;
+    if protocol_version != PROTOCOL_VERSION {
+        bail!(
+            "tunnel server uses unsupported protocol version {protocol_version}; expected {PROTOCOL_VERSION}"
+        );
+    }
+    Ok(())
 }
 
 fn registration_error_is_fatal(error: &anyhow::Error, has_registered: bool) -> bool {
@@ -670,4 +691,27 @@ fn sanitize_tunnel_id(value: &str) -> String {
     }
     result.truncate(63);
     result.trim_end_matches('-').to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{required_header_count, validate_protocol_version};
+
+    #[test]
+    fn requires_current_protocol_version() {
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 2\r\n").is_ok());
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 1\r\n").is_err());
+        assert!(validate_protocol_version("").is_err());
+    }
+
+    #[test]
+    fn requires_valid_capability_counts() {
+        let header = "X-Tnl-Control-Sessions: 8\r\n";
+        assert_eq!(
+            required_header_count(header, "X-Tnl-Control-Sessions", 8).unwrap(),
+            8
+        );
+        assert!(required_header_count(header, "X-Tnl-Control-Sessions", 4).is_err());
+        assert!(required_header_count("", "X-Tnl-Control-Sessions", 8).is_err());
+    }
 }
