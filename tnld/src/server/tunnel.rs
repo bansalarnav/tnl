@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tnl::{TunnelId, server::TunnelServer};
-use tokio::io::{AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::time::timeout;
 
 use super::tls::TlsConnection;
 
 const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_FORWARD_TAG: &str = "tnl/tcp";
+const FORWARD_BUFFER_SIZE: usize = 64 * 1024;
 
 pub async fn forward(
     tunnel_server: &TunnelServer,
@@ -30,9 +31,14 @@ pub async fn forward(
         .write_all(&client_hello)
         .await
         .context("could not forward the visitor TLS ClientHello")?;
-    copy_bidirectional(&mut visitor_stream, &mut data_stream)
-        .await
-        .context("tunnel forwarding failed")?;
+    copy_bidirectional_with_sizes(
+        &mut visitor_stream,
+        &mut data_stream,
+        FORWARD_BUFFER_SIZE,
+        FORWARD_BUFFER_SIZE,
+    )
+    .await
+    .context("tunnel forwarding failed")?;
 
     Ok(())
 }

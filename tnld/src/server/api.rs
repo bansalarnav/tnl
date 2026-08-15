@@ -1,5 +1,5 @@
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{Path, Request, State},
     http::{HeaderValue, StatusCode, header::AUTHORIZATION},
@@ -10,7 +10,10 @@ use axum::{
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tnl::{TunnelId, server::TunnelServer};
+use tnl::{
+    TunnelId,
+    server::{MAX_SESSIONS_PER_TUNNEL, TunnelServer},
+};
 
 use crate::config::Config;
 
@@ -19,6 +22,9 @@ struct ApiState {
     tunnel_server: TunnelServer,
     domain: String,
 }
+
+#[derive(Clone)]
+struct ClientIdentity(String);
 
 pub fn router(tunnel_server: TunnelServer, domain: String) -> Router {
     Router::new()
@@ -31,7 +37,7 @@ pub fn router(tunnel_server: TunnelServer, domain: String) -> Router {
         })
 }
 
-async fn authenticate(request: Request, next: Next) -> Response {
+async fn authenticate(mut request: Request, next: Next) -> Response {
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -55,11 +61,13 @@ async fn authenticate(request: Request, next: Next) -> Response {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    request.extensions_mut().insert(ClientIdentity(token_hash));
     next.run(request).await
 }
 
 async fn open_tunnel(
     State(state): State<ApiState>,
+    Extension(client): Extension<ClientIdentity>,
     Path(tunnel_id): Path<String>,
     mut request: Request<Body>,
 ) -> Response {
@@ -80,7 +88,11 @@ async fn open_tunnel(
             result = async {
                 let upgraded = on_upgrade.await.map_err(anyhow::Error::from)?;
                 tunnel_server
-                    .register(tunnel_id.clone(), TokioIo::new(upgraded))
+                    .register_with_owner(
+                        tunnel_id.clone(),
+                        client.0,
+                        TokioIo::new(upgraded),
+                    )
                     .await
                     .map_err(anyhow::Error::from)
             } => Some(result),
@@ -91,7 +103,16 @@ async fn open_tunnel(
         }
     });
 
-    (StatusCode::OK, [("X-Tnl-Url", url)]).into_response()
+    let control_sessions = HeaderValue::from_str(&MAX_SESSIONS_PER_TUNNEL.to_string())
+        .expect("control session limit is a valid header value");
+    (
+        StatusCode::OK,
+        [
+            ("X-Tnl-Url", url),
+            ("X-Tnl-Control-Sessions", control_sessions),
+        ],
+    )
+        .into_response()
 }
 
 async fn health() -> Json<Value> {

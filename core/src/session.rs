@@ -19,6 +19,7 @@ use crate::SessionError;
 
 const APPLICATION_STREAM_TYPE: StreamType = StreamType::clamp(0);
 const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 512;
+const STREAM_WINDOW_SIZE: usize = 4 * 1024 * 1024;
 
 /// Periodic liveness checks for a multiplexed session.
 #[derive(Clone, Copy, Debug)]
@@ -133,7 +134,9 @@ impl SessionParts {
         if config.max_concurrent_streams == 0 {
             return Err(SessionError::InvalidStreamLimit);
         }
-        let builder = SessionBuilder::new(stream).stream_limit(config.max_concurrent_streams);
+        let builder = SessionBuilder::new(stream)
+            .window_size(STREAM_WINDOW_SIZE)
+            .stream_limit(config.max_concurrent_streams);
         let session = if client {
             builder.client().start()
         } else {

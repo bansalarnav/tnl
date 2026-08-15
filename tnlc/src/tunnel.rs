@@ -14,7 +14,7 @@ use rustls_acme::{AcmeConfig, EventError, EventOk, caches::DirCache, is_tls_alpn
 use socket2::{SockRef, TcpKeepalive};
 use tnl::{SessionConfig, TunnelId, client::TunnelClient};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes},
     net::TcpStream,
     sync::watch,
     task::JoinSet,
@@ -38,6 +38,8 @@ const RECONNECT_JITTER_MAX_MILLIS: u64 = 250;
 const TCP_FORWARD_TAG: &str = "tnl/tcp";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+const FORWARD_BUFFER_SIZE: usize = 64 * 1024;
+const MAX_CONTROL_SESSION_COUNT: usize = 8;
 
 type ApiStream = TlsStream<TcpStream>;
 
@@ -166,7 +168,7 @@ async fn run_control_session(
         .await
         .with_context(|| format!("could not register tunnel {tunnel_id}"))?;
     *has_registered = true;
-    let (control_stream, url) = control_stream;
+    let (control_stream, url, control_session_count) = control_stream;
     let client = TunnelClient::new(
         control_stream,
         SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT),
@@ -190,24 +192,72 @@ async fn run_control_session(
         println!("Obtaining a TLS certificate for {hostname}...");
         *endpoint_tls = Some(start_endpoint_tls(
             cache_directory.to_path_buf(),
-            hostname,
+            hostname.clone(),
             url,
             target,
             background_tasks,
         )?);
     }
 
+    let mut clients = vec![client];
+    for _ in 1..control_session_count {
+        let (control_stream, additional_url, _) = transport
+            .open_tunnel(tunnel_id)
+            .await
+            .with_context(|| format!("could not open an additional session for {tunnel_id}"))?;
+        let additional_hostname = Url::parse(&additional_url)
+            .context("server returned an invalid tunnel URL")?
+            .host_str()
+            .context("server tunnel URL did not contain a hostname")?
+            .to_owned();
+        if additional_hostname != hostname {
+            bail!(
+                "additional tunnel session hostname changed from {hostname} to {additional_hostname}"
+            );
+        }
+        clients.push(
+            TunnelClient::new(
+                control_stream,
+                SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT),
+            )
+            .await?,
+        );
+    }
+
+    let endpoint_tls = endpoint_tls
+        .clone()
+        .context("tunnel endpoint TLS was not initialized")?;
+    let mut control_sessions = JoinSet::new();
+    for client in clients {
+        let endpoint_tls = endpoint_tls.clone();
+        control_sessions
+            .spawn(async move { serve_control_session(client, endpoint_tls, target).await });
+    }
+
+    let result = control_sessions
+        .join_next()
+        .await
+        .context("tunnel did not start any control sessions")?
+        .context("tunnel control session task failed")?;
+    control_sessions.abort_all();
+    result
+}
+
+async fn serve_control_session(
+    client: TunnelClient,
+    endpoint_tls: EndpointTls,
+    target: SocketAddr,
+) -> Result<()> {
+    let mut connection_tasks = JoinSet::new();
     loop {
         let tunnel_stream = client.accept().await?;
         if tunnel_stream.tag() != TCP_FORWARD_TAG {
             eprintln!("ignoring unsupported stream tag: {}", tunnel_stream.tag());
             continue;
         }
-        let endpoint_tls = endpoint_tls
-            .clone()
-            .context("server sent a connection before the tunnel was ready")?;
-        while background_tasks.try_join_next().is_some() {}
-        background_tasks.spawn(async move {
+        let endpoint_tls = endpoint_tls.clone();
+        while connection_tasks.try_join_next().is_some() {}
+        connection_tasks.spawn(async move {
             if let Err(error) = forward_connection(tunnel_stream, endpoint_tls, target).await
                 && !is_routine_connection_error(&error)
             {
@@ -256,9 +306,14 @@ async fn forward_connection(
     let mut local_stream = TcpStream::connect(target)
         .await
         .with_context(|| format!("could not connect to {target}"))?;
-    copy_bidirectional(&mut visitor_stream, &mut local_stream)
-        .await
-        .context("could not forward tunnel connection")?;
+    copy_bidirectional_with_sizes(
+        &mut visitor_stream,
+        &mut local_stream,
+        FORWARD_BUFFER_SIZE,
+        FORWARD_BUFFER_SIZE,
+    )
+    .await
+    .context("could not forward tunnel connection")?;
     Ok(())
 }
 
@@ -316,7 +371,7 @@ fn start_endpoint_tls(
 }
 
 impl HttpTransport {
-    async fn open_tunnel(&self, tunnel_id: &TunnelId) -> Result<(ApiStream, String)> {
+    async fn open_tunnel(&self, tunnel_id: &TunnelId) -> Result<(ApiStream, String, usize)> {
         let host = self
             .api_url
             .host_str()
@@ -328,6 +383,9 @@ impl HttpTransport {
         let tcp_stream = TcpStream::connect((host, port))
             .await
             .with_context(|| format!("could not connect to {host}:{port}"))?;
+        tcp_stream
+            .set_nodelay(true)
+            .with_context(|| format!("could not disable Nagle's algorithm for {host}:{port}"))?;
         configure_tcp_keepalive(&tcp_stream)
             .with_context(|| format!("could not configure TCP keepalive for {host}:{port}"))?;
         let server_name = ServerName::try_from(host.to_owned()).context("invalid API hostname")?;
@@ -372,7 +430,15 @@ impl HttpTransport {
             .filter(|value| !value.is_empty())
             .context("tunnel server response did not include X-Tnl-Url")?;
 
-        Ok((stream, url))
+        let control_session_count = response_header
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-tnl-control-sessions"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .filter(|count| (1..=MAX_CONTROL_SESSION_COUNT).contains(count))
+            .unwrap_or(1);
+
+        Ok((stream, url, control_session_count))
     }
 }
 

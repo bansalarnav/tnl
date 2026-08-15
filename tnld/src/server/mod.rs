@@ -156,6 +156,9 @@ pub async fn start(background: bool) -> Result<()> {
     let mut connections = JoinSet::new();
     loop {
         let (stream, peer_address) = listener.accept().await?;
+        if let Err(error) = stream.set_nodelay(true) {
+            eprintln!("could not disable Nagle's algorithm for {peer_address}: {error}");
+        }
         if let Err(error) = configure_tcp_keepalive(&stream) {
             eprintln!("could not configure TCP keepalive for {peer_address}: {error}");
         }
