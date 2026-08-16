@@ -1738,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "tnl-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "muxado",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "tnlc"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1769,7 +1769,7 @@ dependencies = [
 
 [[package]]
 name = "tnld"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "axum",
