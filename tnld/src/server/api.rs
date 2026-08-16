@@ -1,5 +1,5 @@
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{Path, Request, State},
     http::{HeaderValue, StatusCode, header::AUTHORIZATION},
@@ -10,9 +10,14 @@ use axum::{
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tnl::{TunnelId, server::TunnelServer};
+use tnl::{
+    PROTOCOL_VERSION, TunnelId,
+    server::{MAX_SESSIONS_PER_TUNNEL, RECOMMENDED_IDLE_TRANSPORTS_PER_TUNNEL, TunnelServer},
+};
 
 use crate::config::Config;
+
+const PROTOCOL_VERSION_HEADER: &str = "X-Tnl-Protocol-Version";
 
 #[derive(Clone)]
 struct ApiState {
@@ -20,10 +25,17 @@ struct ApiState {
     domain: String,
 }
 
+#[derive(Clone)]
+struct ClientIdentity(String);
+
 pub fn router(tunnel_server: TunnelServer, domain: String) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/tunnels/{tunnel_id}", connect(open_tunnel))
+        .route(
+            "/v1/tunnels/{tunnel_id}/transports",
+            connect(open_transport),
+        )
         .route_layer(middleware::from_fn(authenticate))
         .with_state(ApiState {
             tunnel_server,
@@ -31,7 +43,7 @@ pub fn router(tunnel_server: TunnelServer, domain: String) -> Router {
         })
 }
 
-async fn authenticate(request: Request, next: Next) -> Response {
+async fn authenticate(mut request: Request, next: Next) -> Response {
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -55,11 +67,13 @@ async fn authenticate(request: Request, next: Next) -> Response {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    request.extensions_mut().insert(ClientIdentity(token_hash));
     next.run(request).await
 }
 
 async fn open_tunnel(
     State(state): State<ApiState>,
+    Extension(client): Extension<ClientIdentity>,
     Path(tunnel_id): Path<String>,
     mut request: Request<Body>,
 ) -> Response {
@@ -69,6 +83,13 @@ async fn open_tunnel(
     let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
         return (StatusCode::BAD_REQUEST, "invalid tunnel name").into_response();
     };
+    if !protocol_version_supported(&request) {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "unsupported or missing tunnel protocol version",
+        )
+            .into_response();
+    }
     let url = format!("https://{tunnel_id}.{}", state.domain);
     let Ok(url) = HeaderValue::from_str(&url) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -80,7 +101,11 @@ async fn open_tunnel(
             result = async {
                 let upgraded = on_upgrade.await.map_err(anyhow::Error::from)?;
                 tunnel_server
-                    .register(tunnel_id.clone(), TokioIo::new(upgraded))
+                    .register_with_owner(
+                        tunnel_id.clone(),
+                        client.0,
+                        TokioIo::new(upgraded),
+                    )
                     .await
                     .map_err(anyhow::Error::from)
             } => Some(result),
@@ -91,9 +116,97 @@ async fn open_tunnel(
         }
     });
 
-    (StatusCode::OK, [("X-Tnl-Url", url)]).into_response()
+    let control_sessions = HeaderValue::from_str(&MAX_SESSIONS_PER_TUNNEL.to_string())
+        .expect("control session limit is a valid header value");
+    let transport_pool = HeaderValue::from_str(&RECOMMENDED_IDLE_TRANSPORTS_PER_TUNNEL.to_string())
+        .expect("transport pool limit is a valid header value");
+    let protocol_version = HeaderValue::from_static(PROTOCOL_VERSION);
+    (
+        StatusCode::OK,
+        [
+            ("X-Tnl-Url", url),
+            ("X-Tnl-Control-Sessions", control_sessions),
+            ("X-Tnl-Transport-Pool", transport_pool),
+            (PROTOCOL_VERSION_HEADER, protocol_version),
+        ],
+    )
+        .into_response()
+}
+
+async fn open_transport(
+    State(state): State<ApiState>,
+    Extension(client): Extension<ClientIdentity>,
+    Path(tunnel_id): Path<String>,
+    mut request: Request<Body>,
+) -> Response {
+    if state.tunnel_server.is_shutdown() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Ok(tunnel_id) = TunnelId::new(tunnel_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid tunnel name").into_response();
+    };
+    if !protocol_version_supported(&request) {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            "unsupported or missing tunnel protocol version",
+        )
+            .into_response();
+    }
+
+    let on_upgrade = hyper::upgrade::on(&mut request);
+    let tunnel_server = state.tunnel_server.clone();
+    tokio::spawn(async move {
+        let result = async {
+            let upgraded = on_upgrade.await.map_err(anyhow::Error::from)?;
+            tunnel_server
+                .register_transport_with_owner(&tunnel_id, client.0, TokioIo::new(upgraded))
+                .map_err(anyhow::Error::from)
+        }
+        .await;
+        if let Err(error) = result {
+            eprintln!("transport for tunnel {tunnel_id} disconnected: {error:#}");
+        }
+    });
+
+    (
+        StatusCode::OK,
+        [(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)],
+    )
+        .into_response()
+}
+
+fn protocol_version_supported(request: &Request<Body>) -> bool {
+    request
+        .headers()
+        .get(PROTOCOL_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(PROTOCOL_VERSION)
 }
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::Body, extract::Request};
+
+    use super::{PROTOCOL_VERSION_HEADER, protocol_version_supported};
+
+    #[test]
+    fn rejects_missing_or_old_protocol_versions() {
+        let current = Request::builder()
+            .header(PROTOCOL_VERSION_HEADER, "2")
+            .body(Body::empty())
+            .unwrap();
+        let old = Request::builder()
+            .header(PROTOCOL_VERSION_HEADER, "1")
+            .body(Body::empty())
+            .unwrap();
+        let missing = Request::new(Body::empty());
+
+        assert!(protocol_version_supported(&current));
+        assert!(!protocol_version_supported(&old));
+        assert!(!protocol_version_supported(&missing));
+    }
 }

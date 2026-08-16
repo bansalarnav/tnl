@@ -4,7 +4,11 @@ use std::{fs, io::Cursor, path::PathBuf, sync::Arc, time::Duration};
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context as _, Result, bail};
-use rustls::{ServerConfig, server::Acceptor};
+use rustls::{
+    CipherSuite, ServerConfig,
+    crypto::{CryptoProvider, ring},
+    server::Acceptor,
+};
 use rustls_acme::{AcmeConfig, EventError, caches::DirCache};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -43,7 +47,7 @@ pub fn manage_certificate(domain: &str, cache_directory: PathBuf) -> Result<Conf
         .directory_lets_encrypt(true)
         .state();
     let configs = Configs {
-        api: acme.default_rustls_config(),
+        api: acme.default_rustls_config_with_provider(transport_crypto_provider()),
         acme_challenge: acme.challenge_rustls_config(),
     };
 
@@ -64,6 +68,14 @@ pub fn manage_certificate(domain: &str, cache_directory: PathBuf) -> Result<Conf
     });
 
     Ok(configs)
+}
+
+fn transport_crypto_provider() -> Arc<CryptoProvider> {
+    let mut provider = ring::default_provider();
+    provider
+        .cipher_suites
+        .sort_by_key(|suite| usize::from(suite.suite() != CipherSuite::TLS13_AES_128_GCM_SHA256));
+    Arc::new(provider)
 }
 
 pub struct TlsConnection {
