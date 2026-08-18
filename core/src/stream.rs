@@ -35,9 +35,11 @@ impl Stream {
         tag: String,
     ) -> Result<Self, SessionError> {
         Self::validate_tag(&tag)?;
-        inner.write_all(HEADER_MAGIC).await?;
-        inner.write_all(&(tag.len() as u16).to_be_bytes()).await?;
-        inner.write_all(tag.as_bytes()).await?;
+        let mut header = Vec::with_capacity(HEADER_MAGIC.len() + 2 + tag.len());
+        header.extend_from_slice(HEADER_MAGIC);
+        header.extend_from_slice(&(tag.len() as u16).to_be_bytes());
+        header.extend_from_slice(tag.as_bytes());
+        inner.write_all(&header).await?;
         Ok(Self { tag, inner })
     }
 
@@ -104,7 +106,6 @@ pub enum SessionError {
     InvalidStreamHeader,
     InvalidTagEncoding(std::string::FromUtf8Error),
     InvalidHeartbeatConfig,
-    InvalidStreamLimit,
     TagTooLong(usize),
 }
 
@@ -117,9 +118,6 @@ impl fmt::Display for SessionError {
             Self::InvalidTagEncoding(_) => formatter.write_str("stream tag is not valid UTF-8"),
             Self::InvalidHeartbeatConfig => formatter
                 .write_str("heartbeat interval must be nonzero and shorter than its timeout"),
-            Self::InvalidStreamLimit => {
-                formatter.write_str("maximum concurrent streams must be greater than zero")
-            }
             Self::TagTooLong(length) => write!(
                 formatter,
                 "stream tag is {length} bytes; maximum is {MAX_TAG_LENGTH}"
@@ -134,10 +132,7 @@ impl Error for SessionError {
             Self::Multiplexer(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::InvalidTagEncoding(error) => Some(error),
-            Self::InvalidStreamHeader
-            | Self::InvalidHeartbeatConfig
-            | Self::InvalidStreamLimit
-            | Self::TagTooLong(_) => None,
+            Self::InvalidStreamHeader | Self::InvalidHeartbeatConfig | Self::TagTooLong(_) => None,
         }
     }
 }

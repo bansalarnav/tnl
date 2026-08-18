@@ -46,11 +46,11 @@ pub struct TunnelServer {
 struct TunnelRegistry {
     shutdown: bool,
     next_session_id: u64,
-    sessions: HashMap<String, RegisteredTunnel>,
+    tunnels: HashMap<String, RegisteredTunnel>,
 }
 
 struct RegisteredTunnel {
-    owner: Option<String>,
+    owner: String,
     sessions: Vec<RegisteredSession>,
     transports: VecDeque<Transport>,
     transport_available: Arc<Notify>,
@@ -58,6 +58,21 @@ struct RegisteredTunnel {
     short_transport_streak: u8,
     transport_backoff_until: Option<Instant>,
     next_session: usize,
+}
+
+impl RegisteredTunnel {
+    fn new(owner: String) -> Self {
+        Self {
+            owner,
+            sessions: Vec::new(),
+            transports: VecDeque::new(),
+            transport_available: Arc::new(Notify::new()),
+            transport_pool_active: false,
+            short_transport_streak: 0,
+            transport_backoff_until: None,
+            next_session: 0,
+        }
+    }
 }
 
 struct RegisteredSession {
@@ -78,17 +93,10 @@ impl TunnelServer {
         }
     }
 
-    /// Registers an authenticated node and starts serving its connection.
-    pub async fn register<S>(&self, tunnel_id: TunnelId, connection: S) -> Result<(), RegisterError>
-    where
-        S: AsyncRead + AsyncWrite + Send + 'static,
-    {
-        self.register_inner(tunnel_id, None, connection).await
-    }
-
-    /// Registers a session owned by an authenticated peer. A tunnel may pool
-    /// multiple sessions only when all of them have the same owner.
-    pub async fn register_with_owner<S>(
+    /// Registers a session owned by an authenticated node and starts serving
+    /// its connection. A tunnel may pool multiple sessions only when all of
+    /// them have the same owner.
+    pub async fn register<S>(
         &self,
         tunnel_id: TunnelId,
         owner: impl Into<String>,
@@ -97,33 +105,15 @@ impl TunnelServer {
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
-        self.register_inner(tunnel_id, Some(owner.into()), connection)
-            .await
-    }
-
-    async fn register_inner<S>(
-        &self,
-        tunnel_id: TunnelId,
-        owner: Option<String>,
-        connection: S,
-    ) -> Result<(), RegisterError>
-    where
-        S: AsyncRead + AsyncWrite + Send + 'static,
-    {
+        let owner = owner.into();
         let (session_id, open_requests) = {
             let mut state = self.state.lock().expect("server lock was poisoned");
             if state.shutdown {
                 return Err(RegisterError::ServerShutdown);
             }
-            let session_count = if let Some(tunnel) = state.sessions.get(tunnel_id.as_str()) {
-                if owner.is_none() || tunnel.owner != owner {
-                    return Err(RegisterError::AlreadyRegistered);
-                }
-                tunnel.sessions.len()
-            } else {
-                0
-            };
-            if session_count >= MAX_SESSIONS_PER_TUNNEL {
+            if let Some(tunnel) = state.tunnels.get(tunnel_id.as_str())
+                && (tunnel.owner != owner || tunnel.sessions.len() >= MAX_SESSIONS_PER_TUNNEL)
+            {
                 return Err(RegisterError::AlreadyRegistered);
             }
 
@@ -131,18 +121,9 @@ impl TunnelServer {
             state.next_session_id = state.next_session_id.wrapping_add(1);
             let (opener, open_requests) = mpsc::channel(32);
             state
-                .sessions
+                .tunnels
                 .entry(tunnel_id.to_string())
-                .or_insert_with(|| RegisteredTunnel {
-                    owner,
-                    sessions: Vec::new(),
-                    transports: VecDeque::new(),
-                    transport_available: Arc::new(Notify::new()),
-                    transport_pool_active: false,
-                    short_transport_streak: 0,
-                    transport_backoff_until: None,
-                    next_session: 0,
-                })
+                .or_insert_with(|| RegisteredTunnel::new(owner))
                 .sessions
                 .push(RegisteredSession { session_id, opener });
             (session_id, open_requests)
@@ -181,7 +162,7 @@ impl TunnelServer {
             if state.shutdown {
                 return Err(muxado::Error::SessionClosed.into());
             }
-            let Some(tunnel) = state.sessions.get_mut(tunnel_id.as_str()) else {
+            let Some(tunnel) = state.tunnels.get_mut(tunnel_id.as_str()) else {
                 return Ok(None);
             };
             let session_index = tunnel.next_session % tunnel.sessions.len();
@@ -197,7 +178,7 @@ impl TunnelServer {
     ///
     /// Dedicated transports are consumed once and avoid sending application
     /// bytes through the multiplexed control session.
-    pub fn register_transport_with_owner<S>(
+    pub fn register_transport<S>(
         &self,
         tunnel_id: &TunnelId,
         owner: impl AsRef<str>,
@@ -210,10 +191,10 @@ impl TunnelServer {
         if state.shutdown {
             return Err(RegisterTransportError::ServerShutdown);
         }
-        let Some(tunnel) = state.sessions.get_mut(tunnel_id.as_str()) else {
+        let Some(tunnel) = state.tunnels.get_mut(tunnel_id.as_str()) else {
             return Err(RegisterTransportError::TunnelNotRegistered);
         };
-        if tunnel.owner.as_deref() != Some(owner.as_ref()) {
+        if tunnel.owner != owner.as_ref() {
             return Err(RegisterTransportError::OwnerMismatch);
         }
         if tunnel.transports.len() >= MAX_TRANSPORTS_PER_TUNNEL {
@@ -230,7 +211,7 @@ impl TunnelServer {
         self.state
             .lock()
             .expect("server lock was poisoned")
-            .sessions
+            .tunnels
             .get_mut(tunnel_id.as_str())
             .and_then(|tunnel| tunnel.transports.pop_front())
     }
@@ -238,7 +219,7 @@ impl TunnelServer {
     /// Returns whether dedicated transport should currently be preferred.
     pub fn transport_pool_preferred(&self, tunnel_id: &TunnelId) -> bool {
         let mut state = self.state.lock().expect("server lock was poisoned");
-        let Some(tunnel) = state.sessions.get_mut(tunnel_id.as_str()) else {
+        let Some(tunnel) = state.tunnels.get_mut(tunnel_id.as_str()) else {
             return false;
         };
         if tunnel
@@ -255,7 +236,7 @@ impl TunnelServer {
     /// workloads can fall back to the reusable multiplexed data plane.
     pub fn report_transport_outcome(&self, tunnel_id: &TunnelId, duration: Duration, bytes: u64) {
         let mut state = self.state.lock().expect("server lock was poisoned");
-        let Some(tunnel) = state.sessions.get_mut(tunnel_id.as_str()) else {
+        let Some(tunnel) = state.tunnels.get_mut(tunnel_id.as_str()) else {
             return;
         };
         if duration <= SHORT_TRANSPORT_MAX_DURATION && bytes <= SHORT_TRANSPORT_MAX_BYTES {
@@ -274,13 +255,13 @@ impl TunnelServer {
     pub async fn take_transport_wait(
         &self,
         tunnel_id: &TunnelId,
-        wait: std::time::Duration,
+        wait: Duration,
     ) -> Option<Transport> {
         let available = self
             .state
             .lock()
             .expect("server lock was poisoned")
-            .sessions
+            .tunnels
             .get(tunnel_id.as_str())
             .map(|tunnel| Arc::clone(&tunnel.transport_available))?;
         let deadline = Instant::now() + wait;
@@ -323,7 +304,7 @@ impl TunnelServer {
     pub fn shutdown(&self) {
         let mut state = self.state.lock().expect("server lock was poisoned");
         state.shutdown = true;
-        state.sessions.clear();
+        state.tunnels.clear();
         drop(state);
         self.shutdown.send_replace(true);
     }
@@ -410,7 +391,7 @@ impl TunnelServer {
 
     fn unregister(&self, tunnel_id: &TunnelId, session_id: u64) {
         let mut state = self.state.lock().expect("server lock was poisoned");
-        let remove_tunnel = if let Some(tunnel) = state.sessions.get_mut(tunnel_id.as_str()) {
+        let remove_tunnel = if let Some(tunnel) = state.tunnels.get_mut(tunnel_id.as_str()) {
             tunnel
                 .sessions
                 .retain(|session| session.session_id != session_id);
@@ -419,7 +400,7 @@ impl TunnelServer {
             false
         };
         if remove_tunnel {
-            state.sessions.remove(tunnel_id.as_str());
+            state.tunnels.remove(tunnel_id.as_str());
         }
     }
 }
@@ -547,7 +528,7 @@ mod tests {
             let (server_side, peer) = duplex(1024);
             peers.push(peer);
             server
-                .register_with_owner(tunnel_id.clone(), "owner-a", server_side)
+                .register(tunnel_id.clone(), "owner-a", server_side)
                 .await
                 .unwrap();
         }
@@ -556,7 +537,7 @@ mod tests {
         peers.push(peer);
         assert!(matches!(
             server
-                .register_with_owner(tunnel_id.clone(), "owner-a", server_side)
+                .register(tunnel_id.clone(), "owner-a", server_side)
                 .await,
             Err(RegisterError::AlreadyRegistered)
         ));
@@ -565,29 +546,13 @@ mod tests {
         let (server_side, peer) = duplex(1024);
         peers.push(peer);
         server
-            .register_with_owner(other_id.clone(), "owner-a", server_side)
+            .register(other_id.clone(), "owner-a", server_side)
             .await
             .unwrap();
         let (server_side, peer) = duplex(1024);
         peers.push(peer);
         assert!(matches!(
-            server
-                .register_with_owner(other_id, "owner-b", server_side)
-                .await,
-            Err(RegisterError::AlreadyRegistered)
-        ));
-    }
-
-    #[tokio::test]
-    async fn legacy_registration_remains_single_session() {
-        let server = TunnelServer::default();
-        let tunnel_id = TunnelId::new("legacy").unwrap();
-        let (first, _first_peer) = duplex(1024);
-        server.register(tunnel_id.clone(), first).await.unwrap();
-
-        let (second, _second_peer) = duplex(1024);
-        assert!(matches!(
-            server.register(tunnel_id, second).await,
+            server.register(other_id, "owner-b", server_side).await,
             Err(RegisterError::AlreadyRegistered)
         ));
     }
@@ -598,14 +563,14 @@ mod tests {
         let tunnel_id = TunnelId::new("transport-pool").unwrap();
         let (control, _control_peer) = duplex(1024);
         server
-            .register_with_owner(tunnel_id.clone(), "owner-a", control)
+            .register(tunnel_id.clone(), "owner-a", control)
             .await
             .unwrap();
         assert!(!server.transport_pool_preferred(&tunnel_id));
 
         let (wrong_owner, _wrong_owner_peer) = duplex(1024);
         assert_eq!(
-            server.register_transport_with_owner(&tunnel_id, "owner-b", wrong_owner),
+            server.register_transport(&tunnel_id, "owner-b", wrong_owner),
             Err(RegisterTransportError::OwnerMismatch)
         );
 
@@ -614,18 +579,17 @@ mod tests {
             let (transport, peer) = duplex(1024);
             transport_peers.push(peer);
             server
-                .register_transport_with_owner(&tunnel_id, "owner-a", transport)
+                .register_transport(&tunnel_id, "owner-a", transport)
                 .unwrap();
         }
 
         let (overflow, _overflow_peer) = duplex(1024);
         assert_eq!(
-            server.register_transport_with_owner(&tunnel_id, "owner-a", overflow),
+            server.register_transport(&tunnel_id, "owner-a", overflow),
             Err(RegisterTransportError::PoolFull)
         );
 
         assert!(server.take_transport(&tunnel_id).is_some());
-        assert_eq!(transport_peers.len(), MAX_TRANSPORTS_PER_TUNNEL);
 
         assert!(server.transport_pool_preferred(&tunnel_id));
         for _ in 0..SHORT_TRANSPORT_STREAK_LIMIT {
@@ -642,7 +606,7 @@ mod tests {
         let tunnel_id = TunnelId::new("transport-wait").unwrap();
         let (control, _control_peer) = duplex(1024);
         server
-            .register_with_owner(tunnel_id.clone(), "owner-a", control)
+            .register(tunnel_id.clone(), "owner-a", control)
             .await
             .unwrap();
 
@@ -657,7 +621,7 @@ mod tests {
 
         let (transport, _transport_peer) = duplex(1024);
         server
-            .register_transport_with_owner(&tunnel_id, "owner-a", transport)
+            .register_transport(&tunnel_id, "owner-a", transport)
             .unwrap();
         assert!(waiter.await.unwrap().is_some());
     }

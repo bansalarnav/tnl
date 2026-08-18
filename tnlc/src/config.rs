@@ -20,15 +20,13 @@ pub struct Config {
 }
 
 pub fn login(blob: &str) -> Result<()> {
+    let invalid_blob = || format!("not a valid {LOGIN_BLOB_PREFIX}* login blob");
     let encoded = blob
         .trim()
         .strip_prefix(LOGIN_BLOB_PREFIX)
-        .with_context(|| format!("not a valid {LOGIN_BLOB_PREFIX}* login blob"))?;
-    let json = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .with_context(|| format!("not a valid {LOGIN_BLOB_PREFIX}* login blob"))?;
-    let payload: LoginPayload = serde_json::from_slice(&json)
-        .with_context(|| format!("not a valid {LOGIN_BLOB_PREFIX}* login blob"))?;
+        .with_context(invalid_blob)?;
+    let json = URL_SAFE_NO_PAD.decode(encoded).with_context(invalid_blob)?;
+    let payload: LoginPayload = serde_json::from_slice(&json).with_context(invalid_blob)?;
 
     let api_url = Url::parse(&payload.api_url).context("login blob contains an invalid API URL")?;
     if api_url.scheme() != "https" || api_url.host().is_none() {

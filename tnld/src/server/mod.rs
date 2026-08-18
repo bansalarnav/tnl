@@ -183,14 +183,14 @@ async fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()>
         return Ok(());
     };
 
-    if server_name == state.domain && connection.is_acme_challenge() {
-        let mut stream = connection
-            .terminate(Arc::clone(&state.acme_tls_config))
-            .await?;
-        stream.shutdown().await?;
-        return Ok(());
-    }
     if server_name == state.domain {
+        if connection.is_acme_challenge() {
+            let mut stream = connection
+                .terminate(Arc::clone(&state.acme_tls_config))
+                .await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
         let stream = connection
             .terminate(Arc::clone(&state.api_tls_config))
             .await?;

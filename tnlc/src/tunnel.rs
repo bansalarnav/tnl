@@ -17,7 +17,8 @@ use rustls::{
 use rustls_acme::{AcmeConfig, EventError, EventOk, caches::DirCache, is_tls_alpn_challenge};
 use socket2::{SockRef, TcpKeepalive};
 use tnl::{
-    PROTOCOL_VERSION, SessionConfig, TRANSPORT_ACTIVATION_MARKER, TunnelId, client::TunnelClient,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, SessionConfig, TRANSPORT_ACTIVATION_MARKER,
+    TunnelId, client::TunnelClient,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
@@ -33,7 +34,6 @@ use url::{Host, Url};
 use crate::config;
 
 const MAX_HTTP_RESPONSE_HEADER_LENGTH: usize = 16 * 1024;
-const PROTOCOL_VERSION_HEADER: &str = "X-Tnl-Protocol-Version";
 const ACME_ORDER_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -130,6 +130,8 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
     run(transport, cache_directory, target, tunnel_id).await
 }
 
+// Prefer AES-128-GCM for the outer transport TLS: same protections against
+// active attackers, measurably faster bulk encryption than the AES-256 default.
 fn transport_crypto_provider() -> Arc<CryptoProvider> {
     let mut provider = ring::default_provider();
     provider.cipher_suites.sort_by_key(|suite| {
@@ -190,27 +192,18 @@ async fn run_control_session(
     has_registered: &mut bool,
     background_tasks: &mut JoinSet<()>,
 ) -> Result<()> {
-    let registration = transport
-        .open_tunnel(tunnel_id)
-        .await
-        .with_context(|| format!("could not register tunnel {tunnel_id}"))?;
-    *has_registered = true;
     let TunnelRegistration {
         stream: control_stream,
         url,
         control_session_count,
         transport_pool_size,
-    } = registration;
-    let client = TunnelClient::new(
-        control_stream,
-        SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT),
-    )
-    .await?;
-    let hostname = Url::parse(&url)
-        .context("server returned an invalid tunnel URL")?
-        .host_str()
-        .context("server tunnel URL did not contain a hostname")?
-        .to_owned();
+    } = transport
+        .open_tunnel(tunnel_id)
+        .await
+        .with_context(|| format!("could not register tunnel {tunnel_id}"))?;
+    *has_registered = true;
+    let client = new_tunnel_client(control_stream).await?;
+    let hostname = tunnel_hostname(&url)?;
 
     if let Some(endpoint_tls) = endpoint_tls {
         if endpoint_tls.hostname.as_ref() != hostname {
@@ -237,25 +230,13 @@ async fn run_control_session(
             .open_tunnel(tunnel_id)
             .await
             .with_context(|| format!("could not open an additional session for {tunnel_id}"))?;
-        let control_stream = additional.stream;
-        let additional_url = additional.url;
-        let additional_hostname = Url::parse(&additional_url)
-            .context("server returned an invalid tunnel URL")?
-            .host_str()
-            .context("server tunnel URL did not contain a hostname")?
-            .to_owned();
+        let additional_hostname = tunnel_hostname(&additional.url)?;
         if additional_hostname != hostname {
             bail!(
                 "additional tunnel session hostname changed from {hostname} to {additional_hostname}"
             );
         }
-        clients.push(
-            TunnelClient::new(
-                control_stream,
-                SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT),
-            )
-            .await?,
-        );
+        clients.push(new_tunnel_client(additional.stream).await?);
     }
 
     let endpoint_tls = endpoint_tls
@@ -263,38 +244,43 @@ async fn run_control_session(
         .context("tunnel endpoint TLS was not initialized")?;
     let mut control_sessions = JoinSet::new();
     for client in clients {
-        let endpoint_tls = endpoint_tls.clone();
-        control_sessions
-            .spawn(async move { serve_control_session(client, endpoint_tls, target).await });
+        control_sessions.spawn(serve_control_session(client, endpoint_tls.clone(), target));
     }
 
     let mut transport_workers = JoinSet::new();
     let transport_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_DEDICATED_TRANSPORTS));
     for _ in 0..transport_pool_size {
-        let transport = Arc::clone(&transport);
-        let transport_permits = Arc::clone(&transport_permits);
-        let tunnel_id = tunnel_id.clone();
-        let endpoint_tls = endpoint_tls.clone();
-        transport_workers.spawn(async move {
-            serve_transport_worker(
-                transport,
-                transport_permits,
-                tunnel_id,
-                endpoint_tls,
-                target,
-            )
-            .await
-        });
+        transport_workers.spawn(serve_transport_worker(
+            Arc::clone(&transport),
+            Arc::clone(&transport_permits),
+            tunnel_id.clone(),
+            endpoint_tls.clone(),
+            target,
+        ));
     }
 
-    let result = control_sessions
+    // Dropping the JoinSets aborts the remaining sessions and workers.
+    control_sessions
         .join_next()
         .await
         .context("tunnel did not start any control sessions")?
-        .context("tunnel control session task failed")?;
-    control_sessions.abort_all();
-    transport_workers.abort_all();
-    result
+        .context("tunnel control session task failed")?
+}
+
+async fn new_tunnel_client(control_stream: ApiStream) -> Result<TunnelClient> {
+    Ok(TunnelClient::new(
+        control_stream,
+        SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT),
+    )
+    .await?)
+}
+
+fn tunnel_hostname(url: &str) -> Result<String> {
+    Ok(Url::parse(url)
+        .context("server returned an invalid tunnel URL")?
+        .host_str()
+        .context("server tunnel URL did not contain a hostname")?
+        .to_owned())
 }
 
 async fn serve_transport_worker(
@@ -316,11 +302,10 @@ async fn serve_transport_worker(
                 let endpoint_tls = endpoint_tls.clone();
                 connection_tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = forward_connection(stream, endpoint_tls, target).await
-                        && !is_routine_connection_error(&error)
-                    {
-                        eprintln!("dedicated tunnel transport failed: {error:#}");
-                    }
+                    log_forward_error(
+                        forward_connection(stream, endpoint_tls, target).await,
+                        "dedicated tunnel transport failed",
+                    );
                 });
             }
             Err(error) => {
@@ -349,11 +334,10 @@ async fn serve_control_session(
         let endpoint_tls = endpoint_tls.clone();
         while connection_tasks.try_join_next().is_some() {}
         connection_tasks.spawn(async move {
-            if let Err(error) = forward_connection(tunnel_stream, endpoint_tls, target).await
-                && !is_routine_connection_error(&error)
-            {
-                eprintln!("tunnel connection failed: {error:#}");
-            }
+            log_forward_error(
+                forward_connection(tunnel_stream, endpoint_tls, target).await,
+                "tunnel connection failed",
+            );
         });
     }
 }
@@ -473,13 +457,10 @@ impl HttpTransport {
             .open_connect(&format!("/v1/tunnels/{tunnel_id}"))
             .await?;
 
-        let url = response_header
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-tnl-url"))
-            .map(|(_, value)| value.trim().to_owned())
+        let url = header_value(&response_header, "X-Tnl-Url")
             .filter(|value| !value.is_empty())
-            .context("tunnel server response did not include X-Tnl-Url")?;
+            .context("tunnel server response did not include X-Tnl-Url")?
+            .to_owned();
 
         let control_session_count = required_header_count(
             &response_header,
@@ -630,6 +611,14 @@ async fn read_http_response_header(stream: &mut ApiStream) -> Result<String> {
         header.push(byte[0]);
     }
     String::from_utf8(header).context("tunnel server returned a non-UTF-8 HTTP response")
+}
+
+fn log_forward_error(result: Result<()>, message: &str) {
+    if let Err(error) = result
+        && !is_routine_connection_error(&error)
+    {
+        eprintln!("{message}: {error:#}");
+    }
 }
 
 fn is_routine_connection_error(error: &anyhow::Error) -> bool {

@@ -18,36 +18,20 @@ use tokio::{
 use crate::SessionError;
 
 const APPLICATION_STREAM_TYPE: StreamType = StreamType::clamp(0);
-const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 512;
+const MAX_CONCURRENT_STREAMS: usize = 512;
 const STREAM_WINDOW_SIZE: usize = 4 * 1024 * 1024;
 
 /// Periodic liveness checks for a multiplexed session.
 #[derive(Clone, Copy, Debug)]
-pub struct HeartbeatConfig {
-    pub interval: Duration,
-    pub timeout: Duration,
+struct HeartbeatConfig {
+    interval: Duration,
+    timeout: Duration,
 }
 
-impl HeartbeatConfig {
-    pub fn new(interval: Duration, timeout: Duration) -> Self {
-        Self { interval, timeout }
-    }
-}
-
-/// Limits and liveness settings applied to a multiplexed session.
-#[derive(Clone, Debug)]
+/// Liveness settings applied to a multiplexed session.
+#[derive(Clone, Debug, Default)]
 pub struct SessionConfig {
     heartbeat: Option<HeartbeatConfig>,
-    max_concurrent_streams: usize,
-}
-
-impl Default for SessionConfig {
-    fn default() -> Self {
-        Self {
-            heartbeat: None,
-            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
-        }
-    }
 }
 
 impl SessionConfig {
@@ -57,22 +41,8 @@ impl SessionConfig {
 
     /// Enables heartbeat checks. A missed heartbeat closes the session.
     pub fn heartbeat(mut self, interval: Duration, timeout: Duration) -> Self {
-        self.heartbeat = Some(HeartbeatConfig::new(interval, timeout));
+        self.heartbeat = Some(HeartbeatConfig { interval, timeout });
         self
-    }
-
-    pub fn heartbeat_config(&self) -> Option<HeartbeatConfig> {
-        self.heartbeat
-    }
-
-    /// Sets the maximum number of simultaneously open streams on one connection.
-    pub fn max_concurrent_streams(mut self, maximum: usize) -> Self {
-        self.max_concurrent_streams = maximum;
-        self
-    }
-
-    pub fn max_concurrent_streams_value(&self) -> usize {
-        self.max_concurrent_streams
     }
 }
 
@@ -131,12 +101,9 @@ impl SessionParts {
         {
             return Err(SessionError::InvalidHeartbeatConfig);
         }
-        if config.max_concurrent_streams == 0 {
-            return Err(SessionError::InvalidStreamLimit);
-        }
         let builder = SessionBuilder::new(stream)
             .window_size(STREAM_WINDOW_SIZE)
-            .stream_limit(config.max_concurrent_streams);
+            .stream_limit(MAX_CONCURRENT_STREAMS);
         let session = if client {
             builder.client().start()
         } else {

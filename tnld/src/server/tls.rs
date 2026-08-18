@@ -70,6 +70,8 @@ pub fn manage_certificate(domain: &str, cache_directory: PathBuf) -> Result<Conf
     Ok(configs)
 }
 
+// Prefer AES-128-GCM for the outer transport TLS: same protections against
+// active attackers, measurably faster bulk encryption than the AES-256 default.
 fn transport_crypto_provider() -> Arc<CryptoProvider> {
     let mut provider = ring::default_provider();
     provider

@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tnl::{TRANSPORT_ACTIVATION_MARKER, TunnelId, server::TunnelServer};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes};
+use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
 
 use super::tls::TlsConnection;
@@ -32,17 +33,14 @@ pub async fn forward(
             .await
             .context("could not activate dedicated tunnel transport")?;
         let started = Instant::now();
-        return match forward_stream(&mut visitor_stream, &mut data_stream, &client_hello).await {
-            Ok((visitor_to_node, node_to_visitor)) => {
-                tunnel_server.report_transport_outcome(
-                    tunnel_id,
-                    started.elapsed(),
-                    visitor_to_node + node_to_visitor + client_hello.len() as u64,
-                );
-                Ok(())
-            }
-            Err(error) => Err(error),
-        };
+        let (visitor_to_node, node_to_visitor) =
+            forward_stream(&mut visitor_stream, &mut data_stream, &client_hello).await?;
+        tunnel_server.report_transport_outcome(
+            tunnel_id,
+            started.elapsed(),
+            visitor_to_node + node_to_visitor + client_hello.len() as u64,
+        );
+        return Ok(());
     }
 
     let Some(mut data_stream) = timeout(
@@ -61,7 +59,7 @@ pub async fn forward(
 }
 
 async fn forward_stream<S>(
-    visitor_stream: &mut tokio::net::TcpStream,
+    visitor_stream: &mut TcpStream,
     data_stream: &mut S,
     client_hello: &[u8],
 ) -> Result<(u64, u64)>
@@ -72,14 +70,12 @@ where
         .write_all(client_hello)
         .await
         .context("could not forward the visitor TLS ClientHello")?;
-    let transferred = copy_bidirectional_with_sizes(
+    copy_bidirectional_with_sizes(
         visitor_stream,
         data_stream,
         FORWARD_BUFFER_SIZE,
         FORWARD_BUFFER_SIZE,
     )
     .await
-    .context("tunnel forwarding failed")?;
-
-    Ok(transferred)
+    .context("tunnel forwarding failed")
 }

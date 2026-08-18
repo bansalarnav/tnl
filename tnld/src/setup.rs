@@ -97,8 +97,6 @@ pub fn run() -> Result<()> {
     };
 
     println!("\nBrowser URL: https://<tunnel-id>.{tunnel_domain}{port_suffix}");
-    // println!("API URL: https://{tunnel_domain}{port_suffix}");
-    // println!("API certificate: issued automatically for {tunnel_domain} on server start");
     println!("Listen address: {listen_address}");
 
     if uses_nip_io {

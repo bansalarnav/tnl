@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, str::FromStr};
+use std::{error::Error, fmt};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TunnelId(String);
@@ -27,22 +27,6 @@ impl TunnelId {
 impl fmt::Display for TunnelId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
-    }
-}
-
-impl FromStr for TunnelId {
-    type Err = InvalidTunnelId;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::new(value)
-    }
-}
-
-impl TryFrom<String> for TunnelId {
-    type Error = InvalidTunnelId;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
     }
 }
 

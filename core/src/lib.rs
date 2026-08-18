@@ -22,6 +22,9 @@ pub use protocol::TunnelId;
 /// HTTP transport protocol version required by this release.
 pub const PROTOCOL_VERSION: &str = "2";
 
+/// HTTP header carrying the tunnel protocol version in both directions.
+pub const PROTOCOL_VERSION_HEADER: &str = "X-Tnl-Protocol-Version";
+
 #[cfg(any(feature = "client", feature = "server"))]
 pub use stream::{MAX_TAG_LENGTH, SessionError, Stream};
 
@@ -33,7 +36,7 @@ pub use transport::Transport;
 pub const TRANSPORT_ACTIVATION_MARKER: &[u8; 4] = b"TNL\x02";
 
 #[cfg(any(feature = "client", feature = "server"))]
-pub use session::{HeartbeatConfig, SessionConfig};
+pub use session::SessionConfig;
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub type ConnectionError = SessionError;
