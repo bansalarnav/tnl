@@ -17,6 +17,8 @@ struct LoginPayload {
 pub struct Config {
     pub api_url: String,
     pub token: String,
+    #[serde(default)]
+    pub connect_addr: Option<String>,
 }
 
 pub fn login(blob: &str) -> Result<()> {
@@ -45,6 +47,7 @@ pub fn login(blob: &str) -> Result<()> {
     let config = Config {
         api_url: payload.api_url,
         token: payload.token,
+        connect_addr: None,
     };
     let json = serde_json::to_string_pretty(&config).context("could not serialize tnl config")?;
     fs::write(&path, format!("{json}\n"))
@@ -77,4 +80,20 @@ pub fn path() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("could not determine the home directory")?
         .join(".tnl/config.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn reads_configs_created_before_connect_address_override() {
+        let config: Config =
+            serde_json::from_str(r#"{"api_url":"https://tnl.example.com","token":"secret"}"#)
+                .unwrap();
+
+        assert_eq!(config.api_url, "https://tnl.example.com");
+        assert_eq!(config.token, "secret");
+        assert_eq!(config.connect_addr, None);
+    }
 }

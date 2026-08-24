@@ -56,6 +56,7 @@ type ApiStream = TlsStream<TcpStream>;
 #[derive(Clone)]
 struct HttpTransport {
     api_url: Url,
+    connect_addr: Option<SocketAddr>,
     authorization: Arc<str>,
     tls_config: Arc<ClientConfig>,
 }
@@ -110,6 +111,12 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
     if config.token.is_empty() || config.token.chars().any(char::is_control) {
         bail!("config contains an invalid token");
     }
+    let connect_addr = config
+        .connect_addr
+        .as_deref()
+        .map(str::parse::<SocketAddr>)
+        .transpose()
+        .context("config contains an invalid connect address")?;
     let cache_directory = config::path()?
         .parent()
         .context("tnlc config path does not have a parent directory")?
@@ -122,6 +129,7 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
         .with_no_client_auth();
     let transport = Arc::new(HttpTransport {
         api_url,
+        connect_addr,
         authorization: Arc::from(format!("Bearer {}", config.token)),
         tls_config: Arc::new(tls_config),
     });
@@ -505,9 +513,14 @@ impl HttpTransport {
             .api_url
             .port_or_known_default()
             .context("API URL does not contain a port")?;
-        let tcp_stream = TcpStream::connect((host, port))
-            .await
-            .with_context(|| format!("could not connect to {host}:{port}"))?;
+        let tcp_stream = match self.connect_addr {
+            Some(address) => TcpStream::connect(address)
+                .await
+                .with_context(|| format!("could not connect to {address}"))?,
+            None => TcpStream::connect((host, port))
+                .await
+                .with_context(|| format!("could not connect to {host}:{port}"))?,
+        };
         tcp_stream
             .set_nodelay(true)
             .with_context(|| format!("could not disable Nagle's algorithm for {host}:{port}"))?;

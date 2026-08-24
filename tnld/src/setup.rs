@@ -2,7 +2,7 @@ use std::{io::Write, net::IpAddr, time::Duration};
 
 use anyhow::Result;
 
-use crate::config::Config;
+use crate::{config::Config, local_client};
 
 fn prompt(message: &str) -> Result<String> {
     print!("{message}");
@@ -134,6 +134,8 @@ pub fn run() -> Result<()> {
     config.write()?;
 
     println!("Configuration saved to {}", Config::path()?.display());
+
+    local_client::ensure()?;
 
     Ok(())
 }

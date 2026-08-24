@@ -37,6 +37,8 @@ curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | s
 
 Setup detects the server's public IP and defaults to a free `nip.io` domain. If you use your own domain, add the DNS records printed by the command. Certificate issuance requires public TCP port 443 to reach the configured listen port. Re-running the server installer upgrades the binaries and restarts the configured service.
 
+The server setup also configures `tnlc` for the same user automatically. This means the server machine can expose its own local ports immediately, for example with `tnlc expose 3000`. Re-running the installer also adds this configuration to servers installed with an older version.
+
 Create credentials for a client:
 
 ```sh

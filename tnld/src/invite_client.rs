@@ -36,12 +36,8 @@ pub fn run(name: &str) -> Result<()> {
     }
     config.write()?;
 
-    let port = match config.listen_port {
-        443 => String::new(),
-        port => format!(":{port}"),
-    };
     let payload = LoginPayload {
-        api_url: format!("https://{}{port}", config.domain),
+        api_url: config.api_url(),
         token,
     };
     let json = serde_json::to_vec(&payload)?;

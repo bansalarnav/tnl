@@ -216,7 +216,7 @@ run_privileged() {
 
 run_as_service_user() {
   case "${1:-}" in
-    setup|stop) ;;
+    setup|setup-client|stop) ;;
     *) echo "Unsupported tnld service action: ${1:-}" >&2; return 1 ;;
   esac
 
@@ -282,6 +282,10 @@ EOF
     fi
     run_as_service_user setup </dev/tty
   fi
+
+  # Existing server installations predate automatic local-client setup. This
+  # is idempotent once the local connection has been configured.
+  run_as_service_user setup-client
 
   if [ -f "$service_home/.tnld/server.pid" ]; then
     echo "Stopping the previous background server..."
