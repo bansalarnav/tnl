@@ -3,7 +3,7 @@ members = ["core", "tnlc", "tnld"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.2"
+version = "0.1.0"
 
 [profile.release]
 codegen-units = 1
