@@ -14,7 +14,7 @@ use rustls::{
     crypto::{CryptoProvider, ring},
     pki_types::ServerName,
 };
-use rustls_acme::{AcmeConfig, EventError, EventOk, caches::DirCache, is_tls_alpn_challenge};
+use rustls_acme::{AcmeConfig, EventOk, caches::DirCache, is_tls_alpn_challenge};
 use socket2::{SockRef, TcpKeepalive};
 use tnl::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, SessionConfig, TRANSPORT_ACTIVATION_MARKER,
@@ -34,7 +34,6 @@ use url::{Host, Url};
 use crate::config;
 
 const MAX_HTTP_RESPONSE_HEADER_LENGTH: usize = 16 * 1024;
-const ACME_ORDER_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
@@ -447,10 +446,6 @@ fn start_endpoint_tls(
                 Ok(EventOk::CertCacheStore | EventOk::AccountCacheStore) => {}
                 Err(error) => {
                     eprintln!("TLS certificate error for {hostname}: {error}");
-                    if matches!(error, EventError::Order(_)) {
-                        eprintln!("Retrying certificate order for {hostname} in 1 hour");
-                        tokio::time::sleep(ACME_ORDER_RETRY_DELAY).await;
-                    }
                 }
             }
         }
