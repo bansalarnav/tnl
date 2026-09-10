@@ -206,6 +206,20 @@ impl TunnelServer {
         Ok(())
     }
 
+    /// Returns the authenticated owner identifier for a registered tunnel.
+    ///
+    /// Servers use this as the key for challenge-response authentication of
+    /// raw data transports. The identifier itself never crosses that raw
+    /// connection.
+    pub fn transport_owner(&self, tunnel_id: &TunnelId) -> Option<String> {
+        self.state
+            .lock()
+            .expect("server lock was poisoned")
+            .tunnels
+            .get(tunnel_id.as_str())
+            .map(|tunnel| tunnel.owner.clone())
+    }
+
     /// Takes the oldest idle dedicated data transport for a tunnel.
     pub fn take_transport(&self, tunnel_id: &TunnelId) -> Option<Transport> {
         self.state

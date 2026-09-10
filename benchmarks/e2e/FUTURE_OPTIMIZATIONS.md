@@ -1,5 +1,9 @@
 # Candidate optimizations, third pass
 
+Update from 2026-09-09: protocol v4 implemented HTTP-aware backend connection pooling and
+authenticated TCP data sockets without outer TLS. Items 2 through 4 below record the pre-v4
+reasoning; their proposed TLS transport and unimplemented pooling are obsolete.
+
 Hypotheses, not measured results. Rounds one and two are recorded in
 [OPTIMIZATION_RESULTS.md](OPTIMIZATION_RESULTS.md) and [ROUND2_RESULTS.md](ROUND2_RESULTS.md);
 the shipped design is described in [OPTIMIZATIONS.md](OPTIMIZATIONS.md).

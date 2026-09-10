@@ -17,13 +17,24 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
 use rustls::ServerConfig;
+use sha2::Sha256;
 use socket2::{SockRef, TcpKeepalive};
-use tnl::{SessionConfig, TunnelId, server::TunnelServer};
+use tnl::{
+    SessionConfig, TunnelId,
+    protocol::{
+        TCP_DATA_CHALLENGE_LENGTH, TCP_DATA_PROOF_LENGTH, TCP_DATA_REGISTRATION_MAGIC,
+        read_tcp_data_registration,
+    },
+    server::TunnelServer,
+};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     task::JoinSet,
+    time::timeout,
 };
 
 use crate::config::Config;
@@ -33,6 +44,7 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+const DATA_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct ServerState {
     domain: String,
@@ -127,13 +139,14 @@ pub async fn start(background: bool) -> Result<()> {
 
     let domain = config.domain.trim_end_matches('.').to_ascii_lowercase();
     let wildcard_suffix = format!(".{domain}");
-    let tls_configs = tls::manage_certificate(&domain, state_directory()?.join("acme"))?;
+    let certificate_cache = state_directory()?.join("acme");
+    let tls_configs = tls::manage_certificate(&domain, certificate_cache)?;
     let tunnel_server =
         TunnelServer::new(SessionConfig::new().heartbeat(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT));
     let api_router = api::router(tunnel_server.clone(), domain.clone());
     let state = Arc::new(ServerState {
         wildcard_suffix,
-        domain,
+        domain: domain.clone(),
         api_tls_config: tls_configs.api,
         acme_tls_config: tls_configs.acme_challenge,
         api_router,
@@ -174,11 +187,25 @@ pub async fn start(background: bool) -> Result<()> {
     }
 }
 
-async fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
-    let connection = match tls::inspect(stream).await? {
-        Some(connection) => connection,
-        None => return Ok(()),
-    };
+async fn handle_connection(mut stream: TcpStream, state: &ServerState) -> Result<()> {
+    let first_byte = stream
+        .read_u8()
+        .await
+        .context("could not read the connection preface")?;
+    if first_byte == TCP_DATA_REGISTRATION_MAGIC[0] {
+        return timeout(
+            DATA_REGISTRATION_TIMEOUT,
+            register_tcp_data_transport(stream, first_byte, &state.tunnel_server),
+        )
+        .await
+        .context("timed out registering a TCP data transport")?;
+    }
+    if first_byte != 22 {
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    let connection = tls::inspect(stream, first_byte).await?;
     let Some(server_name) = connection.server_name() else {
         return Ok(());
     };
@@ -207,6 +234,41 @@ async fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()>
         return Ok(());
     };
     tunnel::forward(&state.tunnel_server, &tunnel_id, connection).await
+}
+
+async fn register_tcp_data_transport(
+    mut stream: TcpStream,
+    first_byte: u8,
+    tunnel_server: &TunnelServer,
+) -> Result<()> {
+    let tunnel_id = read_tcp_data_registration(&mut stream, first_byte)
+        .await
+        .context("invalid TCP data registration")?;
+    let owner = tunnel_server
+        .transport_owner(&tunnel_id)
+        .context("tunnel control connection is not registered")?;
+
+    let mut challenge = [0; TCP_DATA_CHALLENGE_LENGTH];
+    rand::thread_rng().fill_bytes(&mut challenge);
+    stream.write_all(&challenge).await?;
+    stream.flush().await?;
+
+    let mut proof = [0; TCP_DATA_PROOF_LENGTH];
+    stream.read_exact(&mut proof).await?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(owner.as_bytes()).expect("HMAC accepts keys of any size");
+    mac.update(TCP_DATA_REGISTRATION_MAGIC);
+    mac.update(tunnel_id.as_str().as_bytes());
+    mac.update(&challenge);
+    if mac.verify_slice(&proof).is_err() {
+        stream.write_u8(1).await?;
+        bail!("invalid TCP data registration proof");
+    }
+
+    stream.write_u8(0).await?;
+    stream.flush().await?;
+    tunnel_server.register_transport(&tunnel_id, owner, stream)?;
+    Ok(())
 }
 
 fn configure_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {

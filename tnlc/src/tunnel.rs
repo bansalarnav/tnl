@@ -3,11 +3,17 @@ use std::{
     fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, Mac};
+use hyper::{Request, Uri, body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::{
+    client::legacy::{Client as HyperClient, connect::HttpConnector},
+    rt::{TokioExecutor, TokioIo},
+};
 use rand::{Rng, distributions::Alphanumeric};
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
@@ -15,10 +21,16 @@ use rustls::{
     pki_types::ServerName,
 };
 use rustls_acme::{AcmeConfig, EventOk, caches::DirCache, is_tls_alpn_challenge};
+use sha2::{Digest, Sha256};
 use socket2::{SockRef, TcpKeepalive};
 use tnl::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, SessionConfig, TRANSPORT_ACTIVATION_MARKER,
-    TunnelId, client::TunnelClient,
+    TunnelId,
+    client::TunnelClient,
+    protocol::{
+        TCP_DATA_CHALLENGE_LENGTH, TCP_DATA_PROOF_LENGTH, TCP_DATA_REGISTRATION_MAGIC,
+        write_tcp_data_registration,
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
@@ -49,8 +61,9 @@ const MAX_CONTROL_SESSION_COUNT: usize = 8;
 const MAX_TRANSPORT_POOL_SIZE: usize = 64;
 const MAX_CONCURRENT_DEDICATED_TRANSPORTS: usize = 64;
 const TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
-
 type ApiStream = TlsStream<TcpStream>;
+type OriginClient = HyperClient<HttpConnector, Incoming>;
+static ORIGIN_CLIENT: OnceLock<OriginClient> = OnceLock::new();
 
 #[derive(Clone)]
 struct HttpTransport {
@@ -75,6 +88,12 @@ struct TunnelRegistration {
     transport_pool_size: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ForwardConfig {
+    target: SocketAddr,
+    origin_pooling: bool,
+}
+
 #[derive(Debug)]
 struct ApiRejection {
     status: u16,
@@ -93,7 +112,7 @@ impl fmt::Display for ApiRejection {
 
 impl Error for ApiRejection {}
 
-pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
+pub async fn expose(port: u16, name: Option<String>, origin_pooling: bool) -> Result<()> {
     if port == 0 {
         bail!("port must be between 1 and 65535");
     }
@@ -134,11 +153,17 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
     });
     let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
-    run(transport, cache_directory, target, tunnel_id).await
+    run(
+        transport,
+        cache_directory,
+        target,
+        tunnel_id,
+        origin_pooling,
+    )
+    .await
 }
 
-// Prefer AES-128-GCM for the outer transport TLS: same protections against
-// active attackers, measurably faster bulk encryption than the AES-256 default.
+// Prefer AES-128-GCM for control-session TLS.
 fn transport_crypto_provider() -> Arc<CryptoProvider> {
     let mut provider = ring::default_provider();
     provider.cipher_suites.sort_by_key(|suite| {
@@ -152,7 +177,12 @@ async fn run(
     cache_directory: PathBuf,
     target: SocketAddr,
     tunnel_id: TunnelId,
+    origin_pooling: bool,
 ) -> Result<()> {
+    let forward = ForwardConfig {
+        target,
+        origin_pooling,
+    };
     let mut endpoint_tls = None;
     let mut has_registered = false;
     let mut reconnect_delay = RECONNECT_INITIAL_DELAY;
@@ -164,7 +194,7 @@ async fn run(
             Arc::clone(&transport),
             &cache_directory,
             &tunnel_id,
-            target,
+            forward,
             &mut endpoint_tls,
             &mut has_registered,
             &mut background_tasks,
@@ -194,7 +224,7 @@ async fn run_control_session(
     transport: Arc<HttpTransport>,
     cache_directory: &Path,
     tunnel_id: &TunnelId,
-    target: SocketAddr,
+    forward: ForwardConfig,
     endpoint_tls: &mut Option<EndpointTls>,
     has_registered: &mut bool,
     background_tasks: &mut JoinSet<()>,
@@ -226,7 +256,7 @@ async fn run_control_session(
             cache_directory.to_path_buf(),
             hostname.clone(),
             url,
-            target,
+            forward.target,
             background_tasks,
         )?);
     }
@@ -251,7 +281,12 @@ async fn run_control_session(
         .context("tunnel endpoint TLS was not initialized")?;
     let mut control_sessions = JoinSet::new();
     for client in clients {
-        control_sessions.spawn(serve_control_session(client, endpoint_tls.clone(), target));
+        control_sessions.spawn(serve_control_session(
+            client,
+            endpoint_tls.clone(),
+            forward.target,
+            forward.origin_pooling,
+        ));
     }
 
     let mut transport_workers = JoinSet::new();
@@ -262,7 +297,8 @@ async fn run_control_session(
             Arc::clone(&transport_permits),
             tunnel_id.clone(),
             endpoint_tls.clone(),
-            target,
+            forward.target,
+            forward.origin_pooling,
         ));
     }
 
@@ -296,6 +332,7 @@ async fn serve_transport_worker(
     tunnel_id: TunnelId,
     endpoint_tls: EndpointTls,
     target: SocketAddr,
+    origin_pooling: bool,
 ) {
     let mut connection_tasks = JoinSet::new();
     loop {
@@ -310,7 +347,7 @@ async fn serve_transport_worker(
                 connection_tasks.spawn(async move {
                     let _permit = permit;
                     log_forward_error(
-                        forward_connection(stream, endpoint_tls, target).await,
+                        forward_connection(stream, endpoint_tls, target, origin_pooling).await,
                         "dedicated tunnel transport failed",
                     );
                 });
@@ -330,6 +367,7 @@ async fn serve_control_session(
     client: TunnelClient,
     endpoint_tls: EndpointTls,
     target: SocketAddr,
+    origin_pooling: bool,
 ) -> Result<()> {
     let mut connection_tasks = JoinSet::new();
     loop {
@@ -342,7 +380,7 @@ async fn serve_control_session(
         while connection_tasks.try_join_next().is_some() {}
         connection_tasks.spawn(async move {
             log_forward_error(
-                forward_connection(tunnel_stream, endpoint_tls, target).await,
+                forward_connection(tunnel_stream, endpoint_tls, target, origin_pooling).await,
                 "tunnel connection failed",
             );
         });
@@ -353,9 +391,10 @@ async fn forward_connection<S>(
     tunnel_stream: S,
     mut endpoint_tls: EndpointTls,
     target: SocketAddr,
+    origin_pooling: bool,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tunnel_stream)
         .await
@@ -388,21 +427,87 @@ where
         return Ok(());
     }
 
-    let mut local_stream = TcpStream::connect(target)
+    if !origin_pooling {
+        let mut local_stream = TcpStream::connect(target)
+            .await
+            .with_context(|| format!("could not connect to {target}"))?;
+        local_stream
+            .set_nodelay(true)
+            .with_context(|| format!("could not disable Nagle's algorithm for {target}"))?;
+        copy_bidirectional_with_sizes(
+            &mut visitor_stream,
+            &mut local_stream,
+            FORWARD_BUFFER_SIZE,
+            FORWARD_BUFFER_SIZE,
+        )
         .await
-        .with_context(|| format!("could not connect to {target}"))?;
-    local_stream
-        .set_nodelay(true)
-        .with_context(|| format!("could not disable Nagle's algorithm for {target}"))?;
-    copy_bidirectional_with_sizes(
-        &mut visitor_stream,
-        &mut local_stream,
-        FORWARD_BUFFER_SIZE,
-        FORWARD_BUFFER_SIZE,
-    )
-    .await
-    .context("could not forward tunnel connection")?;
+        .context("could not forward tunnel connection")?;
+        return Ok(());
+    }
+
+    let client = origin_client();
+    let service = service_fn(move |mut request: Request<Incoming>| {
+        let client = client.clone();
+        async move {
+            let path = request
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or("/");
+            *request.uri_mut() = Uri::builder()
+                .scheme("http")
+                .authority(target.to_string())
+                .path_and_query(path)
+                .build()
+                .expect("origin URI components are valid");
+
+            let visitor_upgrade = hyper::upgrade::on(&mut request);
+            let mut response = client.request(request).await?;
+            if response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS {
+                let origin_upgrade = hyper::upgrade::on(&mut response);
+                tokio::spawn(async move {
+                    let result = async {
+                        let visitor = visitor_upgrade.await?;
+                        let origin = origin_upgrade.await?;
+                        let mut visitor = TokioIo::new(visitor);
+                        let mut origin = TokioIo::new(origin);
+                        copy_bidirectional_with_sizes(
+                            &mut visitor,
+                            &mut origin,
+                            FORWARD_BUFFER_SIZE,
+                            FORWARD_BUFFER_SIZE,
+                        )
+                        .await?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .await;
+                    log_forward_error(result, "upgraded origin connection failed");
+                });
+            }
+            Ok::<_, hyper_util::client::legacy::Error>(response)
+        }
+    });
+    http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(TokioIo::new(visitor_stream), service)
+        .with_upgrades()
+        .await
+        .context("could not proxy visitor HTTP connection")?;
     Ok(())
+}
+
+fn origin_client() -> OriginClient {
+    ORIGIN_CLIENT
+        .get_or_init(|| {
+            let mut connector = HttpConnector::new();
+            connector.set_nodelay(true);
+            connector.set_keepalive(Some(TCP_KEEPALIVE_IDLE));
+            HyperClient::builder(TokioExecutor::new())
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(64)
+                .build(connector)
+        })
+        .clone()
 }
 
 fn start_endpoint_tls(
@@ -484,10 +589,33 @@ impl HttpTransport {
         })
     }
 
-    async fn open_transport(&self, tunnel_id: &TunnelId) -> Result<ApiStream> {
-        let (mut stream, _) = self
-            .open_connect(&format!("/v1/tunnels/{tunnel_id}/transports"))
-            .await?;
+    async fn open_transport(&self, tunnel_id: &TunnelId) -> Result<TcpStream> {
+        let mut stream = self.open_tcp().await?;
+        write_tcp_data_registration(&mut stream, tunnel_id).await?;
+
+        let mut challenge = [0; TCP_DATA_CHALLENGE_LENGTH];
+        stream
+            .read_exact(&mut challenge)
+            .await
+            .context("tunnel server closed a TCP data registration")?;
+        let token = self
+            .authorization
+            .strip_prefix("Bearer ")
+            .context("invalid authorization value")?;
+        let owner = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let mut mac = Hmac::<Sha256>::new_from_slice(owner.as_bytes())
+            .expect("HMAC accepts keys of any size");
+        mac.update(TCP_DATA_REGISTRATION_MAGIC);
+        mac.update(tunnel_id.as_str().as_bytes());
+        mac.update(&challenge);
+        let proof = mac.finalize().into_bytes();
+        debug_assert_eq!(proof.len(), TCP_DATA_PROOF_LENGTH);
+        stream.write_all(&proof).await?;
+        stream.flush().await?;
+
+        if stream.read_u8().await? != 0 {
+            bail!("tunnel server rejected a TCP data registration");
+        }
         let mut marker = [0; TRANSPORT_ACTIVATION_MARKER.len()];
         stream
             .read_exact(&mut marker)
@@ -496,6 +624,31 @@ impl HttpTransport {
         if &marker != TRANSPORT_ACTIVATION_MARKER {
             bail!("tunnel server sent an invalid transport activation marker");
         }
+        Ok(stream)
+    }
+
+    async fn open_tcp(&self) -> Result<TcpStream> {
+        let host = self
+            .api_url
+            .host_str()
+            .context("API URL does not contain a host")?;
+        let port = self
+            .api_url
+            .port_or_known_default()
+            .context("API URL does not contain a port")?;
+        let stream = match self.connect_addr {
+            Some(address) => TcpStream::connect(address)
+                .await
+                .with_context(|| format!("could not connect to {address}"))?,
+            None => TcpStream::connect((host, port))
+                .await
+                .with_context(|| format!("could not connect to {host}:{port}"))?,
+        };
+        stream
+            .set_nodelay(true)
+            .with_context(|| format!("could not disable Nagle's algorithm for {host}:{port}"))?;
+        configure_tcp_keepalive(&stream)
+            .with_context(|| format!("could not configure TCP keepalive for {host}:{port}"))?;
         Ok(stream)
     }
 
@@ -508,19 +661,7 @@ impl HttpTransport {
             .api_url
             .port_or_known_default()
             .context("API URL does not contain a port")?;
-        let tcp_stream = match self.connect_addr {
-            Some(address) => TcpStream::connect(address)
-                .await
-                .with_context(|| format!("could not connect to {address}"))?,
-            None => TcpStream::connect((host, port))
-                .await
-                .with_context(|| format!("could not connect to {host}:{port}"))?,
-        };
-        tcp_stream
-            .set_nodelay(true)
-            .with_context(|| format!("could not disable Nagle's algorithm for {host}:{port}"))?;
-        configure_tcp_keepalive(&tcp_stream)
-            .with_context(|| format!("could not configure TCP keepalive for {host}:{port}"))?;
+        let tcp_stream = self.open_tcp().await?;
         let server_name = ServerName::try_from(host.to_owned()).context("invalid API hostname")?;
         let mut stream = TlsConnector::from(Arc::clone(&self.tls_config))
             .connect(server_name, tcp_stream)
@@ -696,8 +837,8 @@ mod tests {
 
     #[test]
     fn requires_current_protocol_version() {
-        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 2\r\n").is_ok());
-        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 1\r\n").is_err());
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 4\r\n").is_ok());
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 3\r\n").is_err());
         assert!(validate_protocol_version("").is_err());
     }
 

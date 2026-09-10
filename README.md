@@ -35,7 +35,7 @@ The server needs Linux with systemd, a public IP address, and TCP port 443 open.
 curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | sh -s -- --server
 ```
 
-Setup detects the server's public IP and defaults to a free `nip.io` domain. If you use your own domain, add the DNS records printed by the command. Certificate issuance requires public TCP port 443 to reach the configured listen port. Re-running the server installer upgrades the binaries and restarts the configured service.
+Setup detects the server's public IP and defaults to a free `nip.io` domain. If you use your own domain, add the DNS records printed by the command. Certificate issuance and tunnel traffic require public TCP port 443 to reach the configured listen port. Re-running the server installer upgrades the binaries and restarts the configured service.
 
 The server setup also configures `tnlc` for the same user automatically. This means the server machine can expose its own local ports immediately, for example with `tnlc expose 3000`. Re-running the installer also adds this configuration to servers installed with an older version.
 
@@ -69,6 +69,13 @@ The client prints the public HTTPS URL once it is ready. To request a memorable 
 tnlc expose 3000 --name my-app
 ```
 
+`tnlc` uses raw TCP data sockets. The data path relies on the visitor's end-to-end TLS and does not
+add another encryption layer. HTTPS control sessions remain encrypted, and raw data sockets use
+challenge-response authentication.
+
+HTTP origin connection pooling defaults off. Enable it for a specific backend
+with `--origin-pooling true`; whether it helps depends on the backend and workload.
+
 Keep this command running while the tunnel is in use. Manage the server with systemd:
 
 ```sh
@@ -83,7 +90,7 @@ sudo journalctl -u tnld.service -f
 The workspace contains three packages:
 
 - `tnl-core` in `core/` (imported as `tnl`): transport-neutral tunnel sessions and connection pairing
-- `tnlc`: the command-line client, including HTTPS transport, ACME, and local forwarding
+- `tnlc`: the command-line client, including authenticated raw TCP transport, ACME, and optional pooled HTTP origin forwarding
 - `tnld`: the command-line server, including authentication, HTTP upgrades, TLS, SNI routing, and public forwarding
 
 ## Limitations
