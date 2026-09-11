@@ -73,9 +73,6 @@ tnlc expose 3000 --name my-app
 add another encryption layer. HTTPS control sessions remain encrypted, and raw data sockets use
 challenge-response authentication.
 
-HTTP origin connection pooling defaults off. Enable it for a specific backend
-with `--origin-pooling true`; whether it helps depends on the backend and workload.
-
 Keep this command running while the tunnel is in use. Manage the server with systemd:
 
 ```sh
