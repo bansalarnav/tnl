@@ -1,6 +1,6 @@
 //! Programmatic client and server APIs for tnl tunnels.
 
-mod protocol;
+pub mod protocol;
 
 #[cfg(any(feature = "client", feature = "server"))]
 mod session;
@@ -20,7 +20,7 @@ pub mod server;
 pub use protocol::TunnelId;
 
 /// HTTP transport protocol version required by this release.
-pub const PROTOCOL_VERSION: &str = "2";
+pub const PROTOCOL_VERSION: &str = "4";
 
 /// HTTP header carrying the tunnel protocol version in both directions.
 pub const PROTOCOL_VERSION_HEADER: &str = "X-Tnl-Protocol-Version";

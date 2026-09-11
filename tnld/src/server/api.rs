@@ -30,10 +30,6 @@ pub fn router(tunnel_server: TunnelServer, domain: String) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/tunnels/{tunnel_id}", connect(open_tunnel))
-        .route(
-            "/v1/tunnels/{tunnel_id}/transports",
-            connect(open_transport),
-        )
         .route_layer(middleware::from_fn(authenticate))
         .with_state(ApiState {
             tunnel_server,
@@ -122,39 +118,6 @@ async fn open_tunnel(
         .into_response()
 }
 
-async fn open_transport(
-    State(state): State<ApiState>,
-    Extension(client): Extension<ClientIdentity>,
-    Path(tunnel_id): Path<String>,
-    mut request: Request<Body>,
-) -> Response {
-    let tunnel_id = match validate_tunnel_request(&state, tunnel_id, &request) {
-        Ok(tunnel_id) => tunnel_id,
-        Err(rejection) => return *rejection,
-    };
-
-    let on_upgrade = hyper::upgrade::on(&mut request);
-    let tunnel_server = state.tunnel_server.clone();
-    tokio::spawn(async move {
-        let result = async {
-            let upgraded = on_upgrade.await.map_err(anyhow::Error::from)?;
-            tunnel_server
-                .register_transport(&tunnel_id, client.0, TokioIo::new(upgraded))
-                .map_err(anyhow::Error::from)
-        }
-        .await;
-        if let Err(error) = result {
-            eprintln!("transport for tunnel {tunnel_id} disconnected: {error:#}");
-        }
-    });
-
-    (
-        StatusCode::OK,
-        [(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)],
-    )
-        .into_response()
-}
-
 fn validate_tunnel_request(
     state: &ApiState,
     tunnel_id: String,
@@ -198,11 +161,11 @@ mod tests {
     #[test]
     fn rejects_missing_or_old_protocol_versions() {
         let current = Request::builder()
-            .header(PROTOCOL_VERSION_HEADER, "2")
+            .header(PROTOCOL_VERSION_HEADER, "4")
             .body(Body::empty())
             .unwrap();
         let old = Request::builder()
-            .header(PROTOCOL_VERSION_HEADER, "1")
+            .header(PROTOCOL_VERSION_HEADER, "3")
             .body(Body::empty())
             .unwrap();
         let missing = Request::new(Body::empty());

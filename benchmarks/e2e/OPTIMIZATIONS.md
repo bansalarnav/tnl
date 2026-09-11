@@ -1,5 +1,8 @@
 # Throughput optimization guide
 
+This document describes the historical protocol v2 path and the changes that led to protocol v4's
+authenticated raw TCP data sockets.
+
 This guide explains why each selected optimization exists, how the data paths work, and where
 the implementation lives. Measurements and rejected experiments remain in
 [OPTIMIZATION_RESULTS.md](OPTIMIZATION_RESULTS.md) and [ROUND2_RESULTS.md](ROUND2_RESULTS.md).
@@ -13,12 +16,12 @@ visitor -> tnld visitor socket -> mux stream -> outer TLS/TCP control session
         -> tnlc -> visitor TLS termination -> local backend TCP socket
 ```
 
-The second pass adds a pool of authenticated outer TLS/TCP connections. For a normal bulk
-connection, one idle transport is removed from the pool and becomes that visitor connection's
-data plane:
+The second pass added a pool of authenticated TLS/TCP connections. Protocol v4 removes TLS from
+these data sockets. For a normal bulk connection, one idle transport is removed from the pool and
+becomes that visitor connection's data plane:
 
 ```text
-visitor -> tnld visitor socket -> dedicated outer TLS/TCP transport
+visitor -> tnld visitor socket -> dedicated authenticated TCP transport
         -> tnlc -> visitor TLS termination -> local backend TCP socket
 ```
 
@@ -129,15 +132,6 @@ A longer or larger connection immediately resets this signal. The logic is in
 This lifted the fresh-connection case from about 533 req/s with unconditional dedicated
 transports to 1,518 req/s, close to the first pass's mux-based result.
 
-### Outer TLS cipher preference
-
-The outer tunnel TLS configuration prefers TLS 1.3 AES-128-GCM on this host. It was the best
-measured choice for this workload and avoids spending cycles on a wider key than required. This
-does not change visitor endpoint TLS configuration.
-
-- Client provider ordering: [`tnlc/src/tunnel.rs`](../../tnlc/src/tunnel.rs)
-- Server transport provider ordering: [`tnld/src/server/tls.rs`](../../tnld/src/server/tls.rs)
-
 ### Release code generation
 
 Release builds use thin LTO and one codegen unit in [`Cargo.toml`](../../Cargo.toml). This gives
@@ -152,7 +146,7 @@ that request's end-to-end service time. No other request can overlap socket wake
 encryption, proxy scheduling, or request/response latency.
 
 The direct baseline is an unusually short path: plain HTTP over loopback straight into the
-backend. The tunneled measurement intentionally includes visitor TLS, `tnld`, an outer TLS data
+backend. The tunneled measurement intentionally includes visitor TLS, `tnld`, a dedicated data
 connection, `tnlc`, visitor TLS termination, a second backend TCP socket, and multiple userspace
 copy/scheduling boundaries. For the final empty-response run:
 

@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, Mac};
 use rand::{Rng, distributions::Alphanumeric};
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
@@ -15,10 +16,16 @@ use rustls::{
     pki_types::ServerName,
 };
 use rustls_acme::{AcmeConfig, EventOk, caches::DirCache, is_tls_alpn_challenge};
+use sha2::{Digest, Sha256};
 use socket2::{SockRef, TcpKeepalive};
 use tnl::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, SessionConfig, TRANSPORT_ACTIVATION_MARKER,
-    TunnelId, client::TunnelClient,
+    TunnelId,
+    client::TunnelClient,
+    protocol::{
+        TCP_DATA_CHALLENGE_LENGTH, TCP_DATA_PROOF_LENGTH, TCP_DATA_REGISTRATION_MAGIC,
+        write_tcp_data_registration,
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
@@ -49,7 +56,6 @@ const MAX_CONTROL_SESSION_COUNT: usize = 8;
 const MAX_TRANSPORT_POOL_SIZE: usize = 64;
 const MAX_CONCURRENT_DEDICATED_TRANSPORTS: usize = 64;
 const TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
-
 type ApiStream = TlsStream<TcpStream>;
 
 #[derive(Clone)]
@@ -73,6 +79,11 @@ struct TunnelRegistration {
     url: String,
     control_session_count: usize,
     transport_pool_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ForwardConfig {
+    target: SocketAddr,
 }
 
 #[derive(Debug)]
@@ -137,8 +148,7 @@ pub async fn expose(port: u16, name: Option<String>) -> Result<()> {
     run(transport, cache_directory, target, tunnel_id).await
 }
 
-// Prefer AES-128-GCM for the outer transport TLS: same protections against
-// active attackers, measurably faster bulk encryption than the AES-256 default.
+// Prefer AES-128-GCM for control-session TLS.
 fn transport_crypto_provider() -> Arc<CryptoProvider> {
     let mut provider = ring::default_provider();
     provider.cipher_suites.sort_by_key(|suite| {
@@ -153,6 +163,7 @@ async fn run(
     target: SocketAddr,
     tunnel_id: TunnelId,
 ) -> Result<()> {
+    let forward = ForwardConfig { target };
     let mut endpoint_tls = None;
     let mut has_registered = false;
     let mut reconnect_delay = RECONNECT_INITIAL_DELAY;
@@ -164,7 +175,7 @@ async fn run(
             Arc::clone(&transport),
             &cache_directory,
             &tunnel_id,
-            target,
+            forward,
             &mut endpoint_tls,
             &mut has_registered,
             &mut background_tasks,
@@ -194,7 +205,7 @@ async fn run_control_session(
     transport: Arc<HttpTransport>,
     cache_directory: &Path,
     tunnel_id: &TunnelId,
-    target: SocketAddr,
+    forward: ForwardConfig,
     endpoint_tls: &mut Option<EndpointTls>,
     has_registered: &mut bool,
     background_tasks: &mut JoinSet<()>,
@@ -226,7 +237,7 @@ async fn run_control_session(
             cache_directory.to_path_buf(),
             hostname.clone(),
             url,
-            target,
+            forward.target,
             background_tasks,
         )?);
     }
@@ -251,7 +262,11 @@ async fn run_control_session(
         .context("tunnel endpoint TLS was not initialized")?;
     let mut control_sessions = JoinSet::new();
     for client in clients {
-        control_sessions.spawn(serve_control_session(client, endpoint_tls.clone(), target));
+        control_sessions.spawn(serve_control_session(
+            client,
+            endpoint_tls.clone(),
+            forward.target,
+        ));
     }
 
     let mut transport_workers = JoinSet::new();
@@ -262,7 +277,7 @@ async fn run_control_session(
             Arc::clone(&transport_permits),
             tunnel_id.clone(),
             endpoint_tls.clone(),
-            target,
+            forward.target,
         ));
     }
 
@@ -355,7 +370,7 @@ async fn forward_connection<S>(
     target: SocketAddr,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tunnel_stream)
         .await
@@ -484,10 +499,33 @@ impl HttpTransport {
         })
     }
 
-    async fn open_transport(&self, tunnel_id: &TunnelId) -> Result<ApiStream> {
-        let (mut stream, _) = self
-            .open_connect(&format!("/v1/tunnels/{tunnel_id}/transports"))
-            .await?;
+    async fn open_transport(&self, tunnel_id: &TunnelId) -> Result<TcpStream> {
+        let mut stream = self.open_tcp().await?;
+        write_tcp_data_registration(&mut stream, tunnel_id).await?;
+
+        let mut challenge = [0; TCP_DATA_CHALLENGE_LENGTH];
+        stream
+            .read_exact(&mut challenge)
+            .await
+            .context("tunnel server closed a TCP data registration")?;
+        let token = self
+            .authorization
+            .strip_prefix("Bearer ")
+            .context("invalid authorization value")?;
+        let owner = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let mut mac = Hmac::<Sha256>::new_from_slice(owner.as_bytes())
+            .expect("HMAC accepts keys of any size");
+        mac.update(TCP_DATA_REGISTRATION_MAGIC);
+        mac.update(tunnel_id.as_str().as_bytes());
+        mac.update(&challenge);
+        let proof = mac.finalize().into_bytes();
+        debug_assert_eq!(proof.len(), TCP_DATA_PROOF_LENGTH);
+        stream.write_all(&proof).await?;
+        stream.flush().await?;
+
+        if stream.read_u8().await? != 0 {
+            bail!("tunnel server rejected a TCP data registration");
+        }
         let mut marker = [0; TRANSPORT_ACTIVATION_MARKER.len()];
         stream
             .read_exact(&mut marker)
@@ -496,6 +534,31 @@ impl HttpTransport {
         if &marker != TRANSPORT_ACTIVATION_MARKER {
             bail!("tunnel server sent an invalid transport activation marker");
         }
+        Ok(stream)
+    }
+
+    async fn open_tcp(&self) -> Result<TcpStream> {
+        let host = self
+            .api_url
+            .host_str()
+            .context("API URL does not contain a host")?;
+        let port = self
+            .api_url
+            .port_or_known_default()
+            .context("API URL does not contain a port")?;
+        let stream = match self.connect_addr {
+            Some(address) => TcpStream::connect(address)
+                .await
+                .with_context(|| format!("could not connect to {address}"))?,
+            None => TcpStream::connect((host, port))
+                .await
+                .with_context(|| format!("could not connect to {host}:{port}"))?,
+        };
+        stream
+            .set_nodelay(true)
+            .with_context(|| format!("could not disable Nagle's algorithm for {host}:{port}"))?;
+        configure_tcp_keepalive(&stream)
+            .with_context(|| format!("could not configure TCP keepalive for {host}:{port}"))?;
         Ok(stream)
     }
 
@@ -508,19 +571,7 @@ impl HttpTransport {
             .api_url
             .port_or_known_default()
             .context("API URL does not contain a port")?;
-        let tcp_stream = match self.connect_addr {
-            Some(address) => TcpStream::connect(address)
-                .await
-                .with_context(|| format!("could not connect to {address}"))?,
-            None => TcpStream::connect((host, port))
-                .await
-                .with_context(|| format!("could not connect to {host}:{port}"))?,
-        };
-        tcp_stream
-            .set_nodelay(true)
-            .with_context(|| format!("could not disable Nagle's algorithm for {host}:{port}"))?;
-        configure_tcp_keepalive(&tcp_stream)
-            .with_context(|| format!("could not configure TCP keepalive for {host}:{port}"))?;
+        let tcp_stream = self.open_tcp().await?;
         let server_name = ServerName::try_from(host.to_owned()).context("invalid API hostname")?;
         let mut stream = TlsConnector::from(Arc::clone(&self.tls_config))
             .connect(server_name, tcp_stream)
@@ -696,8 +747,8 @@ mod tests {
 
     #[test]
     fn requires_current_protocol_version() {
-        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 2\r\n").is_ok());
-        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 1\r\n").is_err());
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 4\r\n").is_ok());
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 3\r\n").is_err());
         assert!(validate_protocol_version("").is_err());
     }
 

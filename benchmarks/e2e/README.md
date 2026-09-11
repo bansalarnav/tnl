@@ -93,3 +93,4 @@ Recorded optimization studies:
   concurrency-one results differ from aggregate throughput.
 - [First pass](OPTIMIZATION_RESULTS.md): mux buffers, flow-control window, session pooling, and LTO.
 - [Second pass](ROUND2_RESULTS.md): dedicated data transports, adaptive mux fallback, uploads, and the full checkpoint matrix.
+- [Raw TCP comparison](RAW_TCP_RESULTS.md): outer TLS versus authenticated raw data sockets.

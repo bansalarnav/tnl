@@ -10,10 +10,7 @@ use rustls::{
     server::Acceptor,
 };
 use rustls_acme::{AcmeConfig, caches::DirCache};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::{io::AsyncReadExt, net::TcpStream};
 use tokio_rustls::{StartHandshake, server::TlsStream};
 use tokio_stream::StreamExt;
 
@@ -64,8 +61,7 @@ pub fn manage_certificate(domain: &str, cache_directory: PathBuf) -> Result<Conf
     Ok(configs)
 }
 
-// Prefer AES-128-GCM for the outer transport TLS: same protections against
-// active attackers, measurably faster bulk encryption than the AES-256 default.
+// Prefer AES-128-GCM for API and control-session TLS.
 fn transport_crypto_provider() -> Arc<CryptoProvider> {
     let mut provider = ring::default_provider();
     provider
@@ -107,21 +103,10 @@ impl TlsConnection {
     }
 }
 
-pub async fn inspect(mut stream: TcpStream) -> Result<Option<TlsConnection>> {
-    let mut first_byte = [0];
-    stream
-        .read_exact(&mut first_byte)
-        .await
-        .context("could not read the connection preface")?;
-
-    if first_byte[0] != 22 {
-        stream.shutdown().await?;
-        return Ok(None);
-    }
-
+pub async fn inspect(mut stream: TcpStream, first_byte: u8) -> Result<TlsConnection> {
     let mut acceptor = Acceptor::default();
-    let mut prefix = first_byte.to_vec();
-    feed_acceptor(&mut acceptor, &first_byte)?;
+    let mut prefix = vec![first_byte];
+    feed_acceptor(&mut acceptor, &[first_byte])?;
 
     loop {
         let accepted = acceptor
@@ -133,12 +118,12 @@ pub async fn inspect(mut stream: TcpStream) -> Result<Option<TlsConnection>> {
                 .client_hello()
                 .server_name()
                 .map(|name| name.trim_end_matches('.').to_ascii_lowercase());
-            return Ok(Some(TlsConnection {
+            return Ok(TlsConnection {
                 accepted,
                 server_name,
                 prefix,
                 stream,
-            }));
+            });
         }
 
         let mut buffer = [0; 4096];

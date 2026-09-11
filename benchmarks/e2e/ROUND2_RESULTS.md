@@ -55,9 +55,9 @@ This follows patterns used by established tunnel implementations:
 - [bore](https://github.com/ekzhang/bore#protocol) opens a separate client-to-server TCP
   connection for each visitor connection.
 - [frp](https://github.com/fatedier/frp#connection-pooling) supports pre-established work
-  connections to avoid setup latency, as well as TCP multiplexing and QUIC.
+  connections to avoid setup latency, as well as multiplexed transports.
 - [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/) maintains multiple long-lived
-  outbound connections and commonly carries independent streams over QUIC.
+  outbound connections and can carry independent streams over one transport.
 
 Byte-striping one ordered visitor TCP stream over several transport TCP connections was
 rejected as the default. It would require sequencing and reassembly, and loss or RTT variance
