@@ -1,16 +1,273 @@
 use std::{error::Error, fmt};
 
 #[cfg(any(feature = "client", feature = "server"))]
-use std::io;
-#[cfg(any(feature = "client", feature = "server"))]
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::{
+    io::{self, IoSlice},
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 #[cfg(any(feature = "client", feature = "server"))]
-pub const TCP_DATA_REGISTRATION_MAGIC: &[u8; 5] = b"TNLD\x04";
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub const TCP_DATA_REGISTRATION_MAGIC: &[u8; 5] = b"TNLD\x05";
 #[cfg(any(feature = "client", feature = "server"))]
 pub const TCP_DATA_CHALLENGE_LENGTH: usize = 32;
 #[cfg(any(feature = "client", feature = "server"))]
 pub const TCP_DATA_PROOF_LENGTH: usize = 32;
+#[cfg(any(feature = "client", feature = "server"))]
+const TCP_DATA_FRAME_HEADER_LENGTH: usize = size_of::<u32>();
+#[cfg(any(feature = "client", feature = "server"))]
+const TCP_DATA_MAX_FRAME_LENGTH: usize = 64 * 1024;
+
+/// Presents one framed visitor byte stream over a reusable data transport.
+///
+/// Each direction consists of 4-byte big-endian lengths followed by data. A
+/// zero length ends that direction without shutting down the underlying
+/// transport, allowing another visitor stream to use it afterwards.
+#[cfg(any(feature = "client", feature = "server"))]
+pub struct ReusableTransportStream<S> {
+    inner: S,
+    read_header: [u8; TCP_DATA_FRAME_HEADER_LENGTH],
+    read_header_offset: usize,
+    read_remaining: usize,
+    read_finished: bool,
+    write_header: [u8; TCP_DATA_FRAME_HEADER_LENGTH],
+    write_header_offset: usize,
+    write_remaining: usize,
+    write_finished: bool,
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+impl<S> ReusableTransportStream<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            read_header: [0; TCP_DATA_FRAME_HEADER_LENGTH],
+            read_header_offset: 0,
+            read_remaining: 0,
+            read_finished: false,
+            write_header: [0; TCP_DATA_FRAME_HEADER_LENGTH],
+            write_header_offset: TCP_DATA_FRAME_HEADER_LENGTH,
+            write_remaining: 0,
+            write_finished: false,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.read_finished && self.write_finished && self.write_remaining == 0
+    }
+
+    fn error(kind: io::ErrorKind, message: &'static str) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::new(kind, message)))
+    }
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+impl<S> AsyncRead for ReusableTransportStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if buffer.remaining() == 0 || this.read_finished {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if this.read_remaining > 0 {
+                let capacity = buffer.remaining().min(this.read_remaining);
+                let destination = &mut buffer.initialize_unfilled()[..capacity];
+                let mut limited = ReadBuf::new(destination);
+                match Pin::new(&mut this.inner).poll_read(context, &mut limited) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) => {
+                        let read = limited.filled().len();
+                        if read == 0 {
+                            return Self::error(
+                                io::ErrorKind::UnexpectedEof,
+                                "reusable transport closed during a data frame",
+                            );
+                        }
+                        buffer.advance(read);
+                        this.read_remaining -= read;
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+            }
+
+            while this.read_header_offset < TCP_DATA_FRAME_HEADER_LENGTH {
+                let mut header = ReadBuf::new(
+                    &mut this.read_header[this.read_header_offset..TCP_DATA_FRAME_HEADER_LENGTH],
+                );
+                match Pin::new(&mut this.inner).poll_read(context, &mut header) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) => {
+                        let read = header.filled().len();
+                        if read == 0 {
+                            return Self::error(
+                                io::ErrorKind::UnexpectedEof,
+                                "reusable transport closed before a frame header",
+                            );
+                        }
+                        this.read_header_offset += read;
+                    }
+                }
+            }
+
+            let length = u32::from_be_bytes(this.read_header) as usize;
+            this.read_header_offset = 0;
+            if length == 0 {
+                this.read_finished = true;
+                return Poll::Ready(Ok(()));
+            }
+            if length > TCP_DATA_MAX_FRAME_LENGTH {
+                return Self::error(
+                    io::ErrorKind::InvalidData,
+                    "reusable transport data frame is too large",
+                );
+            }
+            this.read_remaining = length;
+        }
+    }
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+impl<S> AsyncWrite for ReusableTransportStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.write_finished {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "reusable transport stream is finished",
+            )));
+        }
+        if buffer.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        if this.write_remaining == 0 {
+            let length = buffer.len().min(TCP_DATA_MAX_FRAME_LENGTH);
+            this.write_header = (length as u32).to_be_bytes();
+            this.write_header_offset = 0;
+            this.write_remaining = length;
+
+            let slices = [
+                IoSlice::new(&this.write_header),
+                IoSlice::new(&buffer[..length]),
+            ];
+            match Pin::new(&mut this.inner).poll_write_vectored(context, &slices) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "could not write reusable transport data frame",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => {
+                    this.write_header_offset = written.min(TCP_DATA_FRAME_HEADER_LENGTH);
+                    let payload_written = written
+                        .saturating_sub(TCP_DATA_FRAME_HEADER_LENGTH)
+                        .min(length);
+                    this.write_remaining -= payload_written;
+                    if payload_written > 0 {
+                        return Poll::Ready(Ok(payload_written));
+                    }
+                }
+            }
+        }
+
+        while this.write_header_offset < TCP_DATA_FRAME_HEADER_LENGTH {
+            match Pin::new(&mut this.inner)
+                .poll_write(context, &this.write_header[this.write_header_offset..])
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "could not write reusable transport frame header",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => this.write_header_offset += written,
+            }
+        }
+
+        let length = buffer.len().min(this.write_remaining);
+        match Pin::new(&mut this.inner).poll_write(context, &buffer[..length]) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(0)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "could not write reusable transport data frame",
+            ))),
+            Poll::Ready(Ok(written)) => {
+                this.write_remaining -= written;
+                Poll::Ready(Ok(written))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.write_finished {
+            return Poll::Ready(Ok(()));
+        }
+        if this.write_remaining != 0 {
+            return Self::error(
+                io::ErrorKind::InvalidData,
+                "cannot finish an incomplete reusable transport frame",
+            );
+        }
+
+        if this.write_header_offset == TCP_DATA_FRAME_HEADER_LENGTH {
+            this.write_header = 0u32.to_be_bytes();
+            this.write_header_offset = 0;
+        }
+        while this.write_header_offset < TCP_DATA_FRAME_HEADER_LENGTH {
+            match Pin::new(&mut this.inner)
+                .poll_write(context, &this.write_header[this.write_header_offset..])
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "could not finish reusable transport stream",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => this.write_header_offset += written,
+            }
+        }
+
+        match Pin::new(&mut this.inner).poll_flush(context) {
+            Poll::Ready(Ok(())) => {
+                this.write_finished = true;
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub async fn write_tcp_data_registration<W>(stream: &mut W, tunnel_id: &TunnelId) -> io::Result<()>
@@ -105,10 +362,10 @@ impl Error for InvalidTunnelId {}
 #[cfg(test)]
 mod tests {
     use super::{
-        TCP_DATA_REGISTRATION_MAGIC, TunnelId, read_tcp_data_registration,
+        ReusableTransportStream, TCP_DATA_REGISTRATION_MAGIC, TunnelId, read_tcp_data_registration,
         write_tcp_data_registration,
     };
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn validates_tunnel_ids() {
@@ -140,5 +397,41 @@ mod tests {
             tunnel_id
         );
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn carries_sequential_streams_without_closing_the_transport() {
+        let (mut left, mut right) = tokio::io::duplex(1024);
+        let left_task = tokio::spawn(async move {
+            for (sent, expected) in [
+                (b"left one".as_slice(), b"right one".as_slice()),
+                (b"left two".as_slice(), b"right two".as_slice()),
+            ] {
+                let mut stream = ReusableTransportStream::new(&mut left);
+                stream.write_all(sent).await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                assert!(stream.is_finished());
+                assert_eq!(received, expected);
+            }
+        });
+        let right_task = tokio::spawn(async move {
+            for (sent, expected) in [
+                (b"right one".as_slice(), b"left one".as_slice()),
+                (b"right two".as_slice(), b"left two".as_slice()),
+            ] {
+                let mut stream = ReusableTransportStream::new(&mut right);
+                stream.write_all(sent).await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                assert!(stream.is_finished());
+                assert_eq!(received, expected);
+            }
+        });
+
+        left_task.await.unwrap();
+        right_task.await.unwrap();
     }
 }

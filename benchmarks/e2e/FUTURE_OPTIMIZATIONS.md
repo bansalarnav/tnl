@@ -10,33 +10,17 @@ tell whether the cost being targeted is real under realistic conditions.
 
 Ordered by expected value per unit of effort.
 
-## 1. Reusable dedicated transports
+## Implemented: reusable dedicated transports
 
-**Change.** A dedicated transport currently serves exactly one visitor connection and is then
-consumed: `take_transport` pops it from the pool (`core/src/server/mod.rs:229`) and it is never
-returned. Add a connection boundary to the transport protocol so an idle transport can rejoin
-the pool after the visitor disconnects.
+Protocol v5 returns a cleanly completed dedicated transport to its tunnel pool. It uses bounded
+length-prefixed frames and a zero-length end marker in each direction; any forwarding, framing,
+or shutdown error retires the physical connection. A registration-generation check also prevents
+an in-flight transport from being recycled into a later tunnel that reused the same name.
 
-**Why it should work.** Single-use is the root cause of almost all the pool machinery. The warm
-pool of 32, the 64-permit client semaphore, the 250 ms replenishment wait
-(`tnld/src/server/tunnel.rs:11`), and the entire short-connection circuit breaker
-(`core/src/server/mod.rs:23-26`) exist to hide the cost of replacing a consumed TLS connection.
-If transports are reused, that cost mostly disappears along with the machinery that hides it.
-
-**Sketch.** The activation marker (`core/src/lib.rs:33`) already establishes a framing point at
-the start of a claimed transport. A symmetric completion marker, or a length-prefixed
-connection record, lets `tnlc` recognise that the visitor connection ended and re-register the
-transport rather than closing it. Framing cost is per visitor connection, not per 64 KiB block,
-so it does not reintroduce mux's per-frame overhead.
-
-**Risks.** Any desynchronisation between the two ends now corrupts a *subsequent* visitor
-connection rather than just failing the current one. Needs a strict rule that a transport is
-retired rather than reused on any error, timeout, or partial write. This is the main reason to
-treat it as a careful change rather than an obvious one.
-
-**Validation.** Fresh-connection c8 should approach the dedicated-transport bulk path instead of
-requiring mux fallback. If it does, try removing the circuit breaker entirely and confirm the
-number holds.
+This removes transport reconnection and HMAC authentication from the per-visitor path, along with
+the replenishment semaphore and short-connection circuit breaker. The measured result is a clear
+fresh-connection improvement with a smaller bulk-framing regression; see
+[REUSABLE_TRANSPORT_RESULTS.md](REUSABLE_TRANSPORT_RESULTS.md).
 
 ## 2. TLS session resumption on transport replenishment
 

@@ -1,7 +1,7 @@
 # Throughput optimization guide
 
-This document describes the historical protocol v2 path and the changes that led to protocol v4's
-authenticated raw TCP data sockets.
+This document describes the historical protocol v2 path and the changes that led to protocol v5's
+reusable authenticated TCP data sockets.
 
 This guide explains why each selected optimization exists, how the data paths work, and where
 the implementation lives. Measurements and rejected experiments remain in
@@ -16,9 +16,9 @@ visitor -> tnld visitor socket -> mux stream -> outer TLS/TCP control session
         -> tnlc -> visitor TLS termination -> local backend TCP socket
 ```
 
-The second pass added a pool of authenticated TLS/TCP connections. Protocol v4 removes TLS from
-these data sockets. For a normal bulk connection, one idle transport is removed from the pool and
-becomes that visitor connection's data plane:
+The second pass added a pool of authenticated TLS/TCP connections. Protocol v4 removed TLS from
+these data sockets, and protocol v5 made them reusable. For a normal connection, one idle
+transport is removed from the pool and becomes that visitor connection's data plane:
 
 ```text
 visitor -> tnld visitor socket -> dedicated authenticated TCP transport
@@ -26,12 +26,13 @@ visitor -> tnld visitor socket -> dedicated authenticated TCP transport
 ```
 
 `tnld` writes `TRANSPORT_ACTIVATION_MARKER` before application bytes so the waiting `tnlc`
-worker knows that its idle transport has been claimed. The visitor byte stream is not striped
-across transports: one visitor TCP connection always retains one ordered data path.
+worker knows that its idle transport has been claimed. Each direction then carries four-byte
+big-endian lengths followed by up to 64 KiB of data; a zero length ends that direction. Once both
+directions finish cleanly, `tnld` returns the physical connection to the pool. The visitor byte
+stream is not striped across transports: one visitor TCP connection always retains one ordered
+data path.
 
-The mux path remains necessary for compatibility and is faster for bursts of tiny, short-lived
-connections because it reuses an established control connection instead of consuming and then
-replacing a dedicated TLS connection.
+The mux path remains as a bounded fallback when every dedicated transport is active.
 
 ## Selected optimizations
 
@@ -105,32 +106,21 @@ the mux connections continue to carry fallback traffic and tunnel control.
 The API is in `core` because pool ownership and path selection are protocol behavior shared by
 server integrations, rather than an HTTP-server-only detail.
 
-### Warm pool, bounded replenishment, and burst wait
+### Reusable pool and burst wait
 
-The server recommends 32 idle transports. Client workers replenish claimed transports, but a
-64-permit semaphore bounds idle plus active dedicated transports. This avoids a burst of TLS
-handshakes competing with the payload workload. If a burst temporarily empties the pool, `tnld`
-waits up to 250 ms for replenishment, then falls back to mux rather than blocking indefinitely.
+The server recommends 64 persistent transports, matching the previous maximum of 64 idle plus
+active transports. Each client worker owns one physical connection and serves visitor streams on
+it sequentially. If a burst temporarily empties the pool, `tnld` waits up to 250 ms for a returned
+transport, then falls back to mux rather than blocking indefinitely.
 
 - Recommended and maximum sizes plus async availability:
   [`core/src/server/mod.rs`](../../core/src/server/mod.rs)
-- Client workers and semaphore: [`tnlc/src/tunnel.rs`](../../tnlc/src/tunnel.rs)
+- Client workers and framing: [`tnlc/src/tunnel.rs`](../../tnlc/src/tunnel.rs)
 - Bounded wait and fallback: [`tnld/src/server/tunnel.rs`](../../tnld/src/server/tunnel.rs)
 
-The interaction matters: an uncapped replenisher produced handshake storms, while too small a
-warm pool forced c64 bursts back through mux before replacement connections were ready.
-
-### Short-connection circuit breaker
-
-Dedicated transports are single-use at the visitor-connection level. If four consecutive claimed
-transports each finish within 100 ms and transfer at most 64 KiB, core prefers mux for two seconds.
-A longer or larger connection immediately resets this signal. The logic is in
-`TunnelServer::transport_pool_preferred` and `TunnelServer::report_transport_outcome` in
-[`core/src/server/mod.rs`](../../core/src/server/mod.rs), with outcomes reported by
-[`tnld/src/server/tunnel.rs`](../../tnld/src/server/tunnel.rs).
-
-This lifted the fresh-connection case from about 533 req/s with unconditional dedicated
-transports to 1,518 req/s, close to the first pass's mux-based result.
+Using only 32 persistent workers reduced c64 throughput because it also capped active dedicated
+connections at 32. Keeping 64 preserves the old design's peak concurrency without its replacement
+connection and HMAC-authentication churn.
 
 ### Release code generation
 
@@ -167,12 +157,11 @@ improve a workload that has only one active connection.
 
 ## Protocol versioning
 
-The client and server require `X-Tnl-Protocol-Version: 2` on tunnel and transport CONNECT
+The client and server require `X-Tnl-Protocol-Version: 5` on tunnel and transport CONNECT
 requests and responses. Missing or unsupported versions fail registration instead of silently
 selecting a legacy data path. The server still advertises the required pool sizes; these headers
-are mandatory in protocol v2. Dedicated transports are authenticated and bound to the registered
+are mandatory in protocol v5. Dedicated transports are authenticated and bound to the registered
 tunnel owner before entering the pool.
 
-Mux remains part of protocol v2 because it is the measured fast path for high-churn tiny
-connections and a bounded fallback when replenishment cannot satisfy a burst. It is not retained
-to support old peers.
+Mux remains part of protocol v5 as a bounded fallback when all dedicated transports are active. It
+is not retained to support old peers.

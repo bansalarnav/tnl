@@ -1,5 +1,6 @@
 use std::{
     fmt, io,
+    io::IoSlice,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -16,16 +17,22 @@ impl<T> TransportIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 /// through the multiplexed control session.
 pub struct Transport {
     inner: Box<dyn TransportIo>,
+    generation: u64,
 }
 
 impl Transport {
-    pub(crate) fn new<T>(inner: T) -> Self
+    pub(crate) fn new<T>(inner: T, generation: u64) -> Self
     where
         T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         Self {
             inner: Box::new(inner),
+            generation,
         }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -52,6 +59,18 @@ impl AsyncWrite for Transport {
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut *self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.inner).poll_write_vectored(context, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {

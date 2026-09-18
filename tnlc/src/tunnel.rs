@@ -23,14 +23,14 @@ use tnl::{
     TunnelId,
     client::TunnelClient,
     protocol::{
-        TCP_DATA_CHALLENGE_LENGTH, TCP_DATA_PROOF_LENGTH, TCP_DATA_REGISTRATION_MAGIC,
-        write_tcp_data_registration,
+        ReusableTransportStream, TCP_DATA_CHALLENGE_LENGTH, TCP_DATA_PROOF_LENGTH,
+        TCP_DATA_REGISTRATION_MAGIC, write_tcp_data_registration,
     },
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
     net::TcpStream,
-    sync::{Semaphore, watch},
+    sync::watch,
     task::JoinSet,
     time::Instant,
 };
@@ -54,7 +54,6 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 const FORWARD_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_CONTROL_SESSION_COUNT: usize = 8;
 const MAX_TRANSPORT_POOL_SIZE: usize = 64;
-const MAX_CONCURRENT_DEDICATED_TRANSPORTS: usize = 64;
 const TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
 type ApiStream = TlsStream<TcpStream>;
 
@@ -270,11 +269,9 @@ async fn run_control_session(
     }
 
     let mut transport_workers = JoinSet::new();
-    let transport_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_DEDICATED_TRANSPORTS));
     for _ in 0..transport_pool_size {
         transport_workers.spawn(serve_transport_worker(
             Arc::clone(&transport),
-            Arc::clone(&transport_permits),
             tunnel_id.clone(),
             endpoint_tls.clone(),
             forward.target,
@@ -307,36 +304,47 @@ fn tunnel_hostname(url: &str) -> Result<String> {
 
 async fn serve_transport_worker(
     transport: Arc<HttpTransport>,
-    transport_permits: Arc<Semaphore>,
     tunnel_id: TunnelId,
     endpoint_tls: EndpointTls,
     target: SocketAddr,
 ) {
-    let mut connection_tasks = JoinSet::new();
     loop {
-        while connection_tasks.try_join_next().is_some() {}
-        let permit = Arc::clone(&transport_permits)
-            .acquire_owned()
-            .await
-            .expect("dedicated transport semaphore is never closed");
         match transport.open_transport(&tunnel_id).await {
-            Ok(stream) => {
-                let endpoint_tls = endpoint_tls.clone();
-                connection_tasks.spawn(async move {
-                    let _permit = permit;
-                    log_forward_error(
-                        forward_connection(stream, endpoint_tls, target).await,
-                        "dedicated tunnel transport failed",
-                    );
-                });
-            }
+            Ok(mut stream) => log_forward_error(
+                serve_reusable_transport(&mut stream, endpoint_tls.clone(), target).await,
+                "reusable dedicated tunnel transport failed",
+            ),
             Err(error) => {
-                drop(permit);
                 if !is_routine_connection_error(&error) {
-                    eprintln!("could not replenish dedicated tunnel transport: {error:#}");
+                    eprintln!("could not open reusable dedicated tunnel transport: {error:#}");
                 }
-                tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
             }
+        }
+        tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
+    }
+}
+
+async fn serve_reusable_transport(
+    stream: &mut TcpStream,
+    endpoint_tls: EndpointTls,
+    target: SocketAddr,
+) -> Result<()> {
+    loop {
+        let mut marker = [0; TRANSPORT_ACTIVATION_MARKER.len()];
+        stream
+            .read_exact(&mut marker)
+            .await
+            .context("tunnel server closed an idle dedicated transport")?;
+        if &marker != TRANSPORT_ACTIVATION_MARKER {
+            bail!("tunnel server sent an invalid transport activation marker");
+        }
+
+        let mut visitor_transport = ReusableTransportStream::new(&mut *stream);
+        forward_connection(&mut visitor_transport, endpoint_tls.clone(), target).await?;
+        tokio::io::copy(&mut visitor_transport, &mut tokio::io::sink()).await?;
+        visitor_transport.shutdown().await?;
+        if !visitor_transport.is_finished() {
+            bail!("reusable dedicated transport did not finish cleanly");
         }
     }
 }
@@ -348,7 +356,7 @@ async fn serve_control_session(
 ) -> Result<()> {
     let mut connection_tasks = JoinSet::new();
     loop {
-        let tunnel_stream = client.accept().await?;
+        let mut tunnel_stream = client.accept().await?;
         if tunnel_stream.tag() != TCP_FORWARD_TAG {
             eprintln!("ignoring unsupported stream tag: {}", tunnel_stream.tag());
             continue;
@@ -357,7 +365,7 @@ async fn serve_control_session(
         while connection_tasks.try_join_next().is_some() {}
         connection_tasks.spawn(async move {
             log_forward_error(
-                forward_connection(tunnel_stream, endpoint_tls, target).await,
+                forward_connection(&mut tunnel_stream, endpoint_tls, target).await,
                 "tunnel connection failed",
             );
         });
@@ -365,12 +373,12 @@ async fn serve_control_session(
 }
 
 async fn forward_connection<S>(
-    tunnel_stream: S,
+    tunnel_stream: &mut S,
     mut endpoint_tls: EndpointTls,
     target: SocketAddr,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tunnel_stream)
         .await
@@ -525,14 +533,6 @@ impl HttpTransport {
 
         if stream.read_u8().await? != 0 {
             bail!("tunnel server rejected a TCP data registration");
-        }
-        let mut marker = [0; TRANSPORT_ACTIVATION_MARKER.len()];
-        stream
-            .read_exact(&mut marker)
-            .await
-            .context("tunnel server closed an idle dedicated transport")?;
-        if &marker != TRANSPORT_ACTIVATION_MARKER {
-            bail!("tunnel server sent an invalid transport activation marker");
         }
         Ok(stream)
     }
@@ -747,8 +747,8 @@ mod tests {
 
     #[test]
     fn requires_current_protocol_version() {
-        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 4\r\n").is_ok());
-        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 3\r\n").is_err());
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 5\r\n").is_ok());
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 4\r\n").is_err());
         assert!(validate_protocol_version("").is_err());
     }
 

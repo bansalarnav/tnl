@@ -1,10 +1,12 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use tnl::{TRANSPORT_ACTIVATION_MARKER, TunnelId, server::TunnelServer};
+use anyhow::{Context, Result, bail};
+use tnl::{
+    TRANSPORT_ACTIVATION_MARKER, TunnelId, protocol::ReusableTransportStream, server::TunnelServer,
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout};
+use tokio::time::timeout;
 
 use super::tls::TlsConnection;
 
@@ -32,14 +34,15 @@ pub async fn forward(
             .write_all(TRANSPORT_ACTIVATION_MARKER)
             .await
             .context("could not activate dedicated tunnel transport")?;
-        let started = Instant::now();
-        let (visitor_to_node, node_to_visitor) =
-            forward_stream(&mut visitor_stream, &mut data_stream, &client_hello).await?;
-        tunnel_server.report_transport_outcome(
-            tunnel_id,
-            started.elapsed(),
-            visitor_to_node + node_to_visitor + client_hello.len() as u64,
-        );
+        {
+            let mut visitor_transport = ReusableTransportStream::new(&mut data_stream);
+            forward_stream(&mut visitor_stream, &mut visitor_transport, &client_hello).await?;
+            visitor_transport.shutdown().await?;
+            if !visitor_transport.is_finished() {
+                bail!("reusable dedicated transport did not finish cleanly");
+            }
+        }
+        tunnel_server.recycle_transport(tunnel_id, data_stream);
         return Ok(());
     }
 
@@ -53,16 +56,14 @@ pub async fn forward(
         return Ok(());
     };
 
-    forward_stream(&mut visitor_stream, &mut data_stream, &client_hello)
-        .await
-        .map(|_| ())
+    forward_stream(&mut visitor_stream, &mut data_stream, &client_hello).await
 }
 
 async fn forward_stream<S>(
     visitor_stream: &mut TcpStream,
     data_stream: &mut S,
     client_hello: &[u8],
-) -> Result<(u64, u64)>
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -77,5 +78,6 @@ where
         FORWARD_BUFFER_SIZE,
     )
     .await
-    .context("tunnel forwarding failed")
+    .context("tunnel forwarding failed")?;
+    Ok(())
 }

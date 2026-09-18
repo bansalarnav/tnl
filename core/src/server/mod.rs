@@ -19,11 +19,7 @@ pub const MAX_SESSIONS_PER_TUNNEL: usize = 8;
 /// Maximum number of idle dedicated data transports retained for one tunnel.
 pub const MAX_TRANSPORTS_PER_TUNNEL: usize = 64;
 /// Number of idle dedicated transports a node should normally keep warm.
-pub const RECOMMENDED_IDLE_TRANSPORTS_PER_TUNNEL: usize = 32;
-const SHORT_TRANSPORT_MAX_DURATION: Duration = Duration::from_millis(100);
-const SHORT_TRANSPORT_MAX_BYTES: u64 = 64 * 1024;
-const SHORT_TRANSPORT_STREAK_LIMIT: u8 = 4;
-const SHORT_TRANSPORT_BACKOFF: Duration = Duration::from_secs(2);
+pub const RECOMMENDED_IDLE_TRANSPORTS_PER_TUNNEL: usize = MAX_TRANSPORTS_PER_TUNNEL;
 
 type IncomingStream = Result<(TunnelId, Stream), ConnectionError>;
 type IncomingStreamReceiver = Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<IncomingStream>>>;
@@ -51,25 +47,23 @@ struct TunnelRegistry {
 
 struct RegisteredTunnel {
     owner: String,
+    generation: u64,
     sessions: Vec<RegisteredSession>,
     transports: VecDeque<Transport>,
     transport_available: Arc<Notify>,
     transport_pool_active: bool,
-    short_transport_streak: u8,
-    transport_backoff_until: Option<Instant>,
     next_session: usize,
 }
 
 impl RegisteredTunnel {
-    fn new(owner: String) -> Self {
+    fn new(owner: String, generation: u64) -> Self {
         Self {
             owner,
+            generation,
             sessions: Vec::new(),
             transports: VecDeque::new(),
             transport_available: Arc::new(Notify::new()),
             transport_pool_active: false,
-            short_transport_streak: 0,
-            transport_backoff_until: None,
             next_session: 0,
         }
     }
@@ -123,7 +117,7 @@ impl TunnelServer {
             state
                 .tunnels
                 .entry(tunnel_id.to_string())
-                .or_insert_with(|| RegisteredTunnel::new(owner))
+                .or_insert_with(|| RegisteredTunnel::new(owner, session_id))
                 .sessions
                 .push(RegisteredSession { session_id, opener });
             (session_id, open_requests)
@@ -176,8 +170,8 @@ impl TunnelServer {
 
     /// Adds an authenticated, dedicated data transport to a registered tunnel.
     ///
-    /// Dedicated transports are consumed once and avoid sending application
-    /// bytes through the multiplexed control session.
+    /// Dedicated transports avoid sending application bytes through the
+    /// multiplexed control session and may be recycled after use.
     pub fn register_transport<S>(
         &self,
         tunnel_id: &TunnelId,
@@ -201,7 +195,9 @@ impl TunnelServer {
             return Err(RegisterTransportError::PoolFull);
         }
         tunnel.transport_pool_active = true;
-        tunnel.transports.push_back(Transport::new(connection));
+        tunnel
+            .transports
+            .push_back(Transport::new(connection, tunnel.generation));
         tunnel.transport_available.notify_waiters();
         Ok(())
     }
@@ -230,39 +226,29 @@ impl TunnelServer {
             .and_then(|tunnel| tunnel.transports.pop_front())
     }
 
-    /// Returns whether dedicated transport should currently be preferred.
-    pub fn transport_pool_preferred(&self, tunnel_id: &TunnelId) -> bool {
-        let mut state = self.state.lock().expect("server lock was poisoned");
-        let Some(tunnel) = state.tunnels.get_mut(tunnel_id.as_str()) else {
-            return false;
-        };
-        if tunnel
-            .transport_backoff_until
-            .is_some_and(|deadline| deadline > Instant::now())
-        {
-            return false;
-        }
-        tunnel.transport_backoff_until = None;
-        tunnel.transport_pool_active
-    }
-
-    /// Reports how a consumed dedicated transport behaved so short-connection
-    /// workloads can fall back to the reusable multiplexed data plane.
-    pub fn report_transport_outcome(&self, tunnel_id: &TunnelId, duration: Duration, bytes: u64) {
+    /// Returns a successfully completed dedicated transport to its tunnel.
+    pub fn recycle_transport(&self, tunnel_id: &TunnelId, transport: Transport) {
         let mut state = self.state.lock().expect("server lock was poisoned");
         let Some(tunnel) = state.tunnels.get_mut(tunnel_id.as_str()) else {
             return;
         };
-        if duration <= SHORT_TRANSPORT_MAX_DURATION && bytes <= SHORT_TRANSPORT_MAX_BYTES {
-            tunnel.short_transport_streak = tunnel.short_transport_streak.saturating_add(1);
-            if tunnel.short_transport_streak >= SHORT_TRANSPORT_STREAK_LIMIT {
-                tunnel.transport_backoff_until = Some(Instant::now() + SHORT_TRANSPORT_BACKOFF);
-                tunnel.short_transport_streak = 0;
-            }
-        } else {
-            tunnel.short_transport_streak = 0;
-            tunnel.transport_backoff_until = None;
+        if transport.generation() != tunnel.generation
+            || tunnel.transports.len() >= MAX_TRANSPORTS_PER_TUNNEL
+        {
+            return;
         }
+        tunnel.transports.push_back(transport);
+        tunnel.transport_available.notify_waiters();
+    }
+
+    /// Returns whether dedicated transport should currently be preferred.
+    pub fn transport_pool_preferred(&self, tunnel_id: &TunnelId) -> bool {
+        self.state
+            .lock()
+            .expect("server lock was poisoned")
+            .tunnels
+            .get(tunnel_id.as_str())
+            .is_some_and(|tunnel| tunnel.transport_pool_active)
     }
 
     /// Waits briefly for a dedicated transport to become available.
@@ -528,7 +514,7 @@ mod tests {
 
     use super::{
         MAX_SESSIONS_PER_TUNNEL, MAX_TRANSPORTS_PER_TUNNEL, RegisterError, RegisterTransportError,
-        SHORT_TRANSPORT_STREAK_LIMIT, TunnelServer,
+        TunnelServer,
     };
     use crate::TunnelId;
 
@@ -603,14 +589,9 @@ mod tests {
             Err(RegisterTransportError::PoolFull)
         );
 
+        let transport = server.take_transport(&tunnel_id).unwrap();
+        server.recycle_transport(&tunnel_id, transport);
         assert!(server.take_transport(&tunnel_id).is_some());
-
-        assert!(server.transport_pool_preferred(&tunnel_id));
-        for _ in 0..SHORT_TRANSPORT_STREAK_LIMIT {
-            server.report_transport_outcome(&tunnel_id, Duration::from_millis(5), 1024);
-        }
-        assert!(!server.transport_pool_preferred(&tunnel_id));
-        server.report_transport_outcome(&tunnel_id, Duration::from_secs(1), 1024 * 1024);
         assert!(server.transport_pool_preferred(&tunnel_id));
     }
 
@@ -638,5 +619,31 @@ mod tests {
             .register_transport(&tunnel_id, "owner-a", transport)
             .unwrap();
         assert!(waiter.await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn does_not_recycle_a_transport_across_tunnel_registrations() {
+        let server = TunnelServer::default();
+        let tunnel_id = TunnelId::new("transport-generation").unwrap();
+        let (control, _control_peer) = duplex(1024);
+        server
+            .register(tunnel_id.clone(), "owner-a", control)
+            .await
+            .unwrap();
+        let (transport, _transport_peer) = duplex(1024);
+        server
+            .register_transport(&tunnel_id, "owner-a", transport)
+            .unwrap();
+        let transport = server.take_transport(&tunnel_id).unwrap();
+
+        server.unregister(&tunnel_id, 0);
+        let (replacement_control, _replacement_peer) = duplex(1024);
+        server
+            .register(tunnel_id.clone(), "owner-b", replacement_control)
+            .await
+            .unwrap();
+        server.recycle_transport(&tunnel_id, transport);
+
+        assert!(server.take_transport(&tunnel_id).is_none());
     }
 }
