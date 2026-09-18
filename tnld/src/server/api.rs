@@ -161,11 +161,11 @@ mod tests {
     #[test]
     fn rejects_missing_or_old_protocol_versions() {
         let current = Request::builder()
-            .header(PROTOCOL_VERSION_HEADER, "5")
+            .header(PROTOCOL_VERSION_HEADER, "6")
             .body(Body::empty())
             .unwrap();
         let old = Request::builder()
-            .header(PROTOCOL_VERSION_HEADER, "4")
+            .header(PROTOCOL_VERSION_HEADER, "5")
             .body(Body::empty())
             .unwrap();
         let missing = Request::new(Body::empty());

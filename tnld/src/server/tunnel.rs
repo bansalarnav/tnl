@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tnl::{
-    TRANSPORT_ACTIVATION_MARKER, TunnelId, protocol::ReusableTransportStream, server::TunnelServer,
+    TRANSPORT_ACTIVATION_MARKER, TunnelId, protocol::SidebandTransportStream, server::TunnelServer,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::TcpStream;
@@ -30,17 +30,16 @@ pub async fn forward(
         None
     };
     if let Some(mut data_stream) = dedicated_transport {
-        data_stream
-            .write_all(TRANSPORT_ACTIVATION_MARKER)
-            .await
-            .context("could not activate dedicated tunnel transport")?;
         {
-            let mut visitor_transport = ReusableTransportStream::new(&mut data_stream);
+            let (mut raw_data, mut sideband) = data_stream.split();
+            raw_data
+                .write_all(TRANSPORT_ACTIVATION_MARKER)
+                .await
+                .context("could not activate dedicated tunnel transport")?;
+            let mut visitor_transport = SidebandTransportStream::new(&mut raw_data, &mut sideband);
             forward_stream(&mut visitor_stream, &mut visitor_transport, &client_hello).await?;
             visitor_transport.shutdown().await?;
-            if !visitor_transport.is_finished() {
-                bail!("reusable dedicated transport did not finish cleanly");
-            }
+            visitor_transport.finish().await?;
         }
         tunnel_server.recycle_transport(tunnel_id, data_stream);
         return Ok(());

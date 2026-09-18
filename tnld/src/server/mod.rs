@@ -11,7 +11,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -23,7 +26,7 @@ use rustls::ServerConfig;
 use sha2::Sha256;
 use socket2::{SockRef, TcpKeepalive};
 use tnl::{
-    SessionConfig, TunnelId,
+    SessionConfig, TRANSPORT_SIDEBAND_TAG_PREFIX, TunnelId,
     protocol::{
         TCP_DATA_CHALLENGE_LENGTH, TCP_DATA_PROOF_LENGTH, TCP_DATA_REGISTRATION_MAGIC,
         read_tcp_data_registration,
@@ -53,6 +56,7 @@ struct ServerState {
     acme_tls_config: Arc<ServerConfig>,
     api_router: Router,
     tunnel_server: TunnelServer,
+    next_transport_id: AtomicU64,
 }
 
 fn state_directory() -> Result<PathBuf> {
@@ -151,6 +155,7 @@ pub async fn start(background: bool) -> Result<()> {
         acme_tls_config: tls_configs.acme_challenge,
         api_router,
         tunnel_server: tunnel_server.clone(),
+        next_transport_id: AtomicU64::new(1),
     });
 
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.listen_port);
@@ -195,7 +200,7 @@ async fn handle_connection(mut stream: TcpStream, state: &ServerState) -> Result
     if first_byte == TCP_DATA_REGISTRATION_MAGIC[0] {
         return timeout(
             DATA_REGISTRATION_TIMEOUT,
-            register_tcp_data_transport(stream, first_byte, &state.tunnel_server),
+            register_tcp_data_transport(stream, first_byte, state),
         )
         .await
         .context("timed out registering a TCP data transport")?;
@@ -239,12 +244,13 @@ async fn handle_connection(mut stream: TcpStream, state: &ServerState) -> Result
 async fn register_tcp_data_transport(
     mut stream: TcpStream,
     first_byte: u8,
-    tunnel_server: &TunnelServer,
+    state: &ServerState,
 ) -> Result<()> {
     let tunnel_id = read_tcp_data_registration(&mut stream, first_byte)
         .await
         .context("invalid TCP data registration")?;
-    let owner = tunnel_server
+    let owner = state
+        .tunnel_server
         .transport_owner(&tunnel_id)
         .context("tunnel control connection is not registered")?;
 
@@ -265,9 +271,22 @@ async fn register_tcp_data_transport(
         bail!("invalid TCP data registration proof");
     }
 
+    let transport_id = state.next_transport_id.fetch_add(1, Ordering::Relaxed);
     stream.write_u8(0).await?;
+    stream.write_u64(transport_id).await?;
     stream.flush().await?;
-    tunnel_server.register_transport(&tunnel_id, owner, stream)?;
+    if stream.read_u8().await? != 0 {
+        bail!("tunnel client rejected a TCP data transport identifier");
+    }
+    let sideband_tag = format!("{TRANSPORT_SIDEBAND_TAG_PREFIX}{transport_id:016x}");
+    let sideband = state
+        .tunnel_server
+        .open(&tunnel_id, sideband_tag)
+        .await?
+        .context("tunnel control connection closed during TCP data registration")?;
+    state
+        .tunnel_server
+        .register_transport(&tunnel_id, owner, stream, sideband)?;
     Ok(())
 }
 

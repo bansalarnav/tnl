@@ -172,14 +172,16 @@ impl TunnelServer {
     ///
     /// Dedicated transports avoid sending application bytes through the
     /// multiplexed control session and may be recycled after use.
-    pub fn register_transport<S>(
+    pub fn register_transport<S, C>(
         &self,
         tunnel_id: &TunnelId,
         owner: impl AsRef<str>,
         connection: S,
+        sideband: C,
     ) -> Result<(), RegisterTransportError>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        C: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let mut state = self.state.lock().expect("server lock was poisoned");
         if state.shutdown {
@@ -197,7 +199,7 @@ impl TunnelServer {
         tunnel.transport_pool_active = true;
         tunnel
             .transports
-            .push_back(Transport::new(connection, tunnel.generation));
+            .push_back(Transport::new(connection, sideband, tunnel.generation));
         tunnel.transport_available.notify_waiters();
         Ok(())
     }
@@ -569,23 +571,26 @@ mod tests {
         assert!(!server.transport_pool_preferred(&tunnel_id));
 
         let (wrong_owner, _wrong_owner_peer) = duplex(1024);
+        let (wrong_sideband, _wrong_sideband_peer) = duplex(1024);
         assert_eq!(
-            server.register_transport(&tunnel_id, "owner-b", wrong_owner),
+            server.register_transport(&tunnel_id, "owner-b", wrong_owner, wrong_sideband,),
             Err(RegisterTransportError::OwnerMismatch)
         );
 
         let mut transport_peers = Vec::new();
         for _ in 0..MAX_TRANSPORTS_PER_TUNNEL {
             let (transport, peer) = duplex(1024);
-            transport_peers.push(peer);
+            let (sideband, sideband_peer) = duplex(1024);
+            transport_peers.push((peer, sideband_peer));
             server
-                .register_transport(&tunnel_id, "owner-a", transport)
+                .register_transport(&tunnel_id, "owner-a", transport, sideband)
                 .unwrap();
         }
 
         let (overflow, _overflow_peer) = duplex(1024);
+        let (overflow_sideband, _overflow_sideband_peer) = duplex(1024);
         assert_eq!(
-            server.register_transport(&tunnel_id, "owner-a", overflow),
+            server.register_transport(&tunnel_id, "owner-a", overflow, overflow_sideband,),
             Err(RegisterTransportError::PoolFull)
         );
 
@@ -615,8 +620,9 @@ mod tests {
         tokio::task::yield_now().await;
 
         let (transport, _transport_peer) = duplex(1024);
+        let (sideband, _sideband_peer) = duplex(1024);
         server
-            .register_transport(&tunnel_id, "owner-a", transport)
+            .register_transport(&tunnel_id, "owner-a", transport, sideband)
             .unwrap();
         assert!(waiter.await.unwrap().is_some());
     }
@@ -631,8 +637,9 @@ mod tests {
             .await
             .unwrap();
         let (transport, _transport_peer) = duplex(1024);
+        let (sideband, _sideband_peer) = duplex(1024);
         server
-            .register_transport(&tunnel_id, "owner-a", transport)
+            .register_transport(&tunnel_id, "owner-a", transport, sideband)
             .unwrap();
         let transport = server.take_transport(&tunnel_id).unwrap();
 

@@ -12,14 +12,16 @@ Ordered by expected value per unit of effort.
 
 ## Implemented: reusable dedicated transports
 
-Protocol v5 returns a cleanly completed dedicated transport to its tunnel pool. It uses bounded
-length-prefixed frames and a zero-length end marker in each direction; any forwarding, framing,
-or shutdown error retires the physical connection. A registration-generation check also prevents
-an in-flight transport from being recycled into a later tunnel that reused the same name.
+Protocol v6 returns a cleanly completed dedicated transport to its tunnel pool. Payload stays raw.
+A persistent mux sideband carries the final byte count for each direction, and both peers
+acknowledge consuming exactly those bytes before reuse. Any forwarding, boundary, or shutdown
+error retires both channels. A registration-generation check also prevents an in-flight transport
+from being recycled into a later tunnel that reused the same name.
 
 This removes transport reconnection and HMAC authentication from the per-visitor path, along with
-the replenishment semaphore and short-connection circuit breaker. The measured result is a clear
-fresh-connection improvement with a smaller bulk-framing regression; see
+the replenishment semaphore and short-connection circuit breaker. The framed protocol v5
+experiment improved connection churn but regressed established streams. The sideband design
+recovers most of that throughput while retaining part of the churn gain; see
 [REUSABLE_TRANSPORT_RESULTS.md](REUSABLE_TRANSPORT_RESULTS.md).
 
 ## 2. TLS session resumption on transport replenishment

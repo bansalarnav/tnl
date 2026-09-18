@@ -1,6 +1,6 @@
 # Throughput optimization guide
 
-This document describes the historical protocol v2 path and the changes that led to protocol v5's
+This document describes the historical protocol v2 path and the changes that led to protocol v6's
 reusable authenticated TCP data sockets.
 
 This guide explains why each selected optimization exists, how the data paths work, and where
@@ -17,8 +17,9 @@ visitor -> tnld visitor socket -> mux stream -> outer TLS/TCP control session
 ```
 
 The second pass added a pool of authenticated TLS/TCP connections. Protocol v4 removed TLS from
-these data sockets, and protocol v5 made them reusable. For a normal connection, one idle
-transport is removed from the pool and becomes that visitor connection's data plane:
+these data sockets. Protocol v6 pairs each raw data socket with a persistent boundary stream and
+makes the pair reusable. For a normal connection, one idle transport is removed from the pool and
+becomes that visitor connection's data plane:
 
 ```text
 visitor -> tnld visitor socket -> dedicated authenticated TCP transport
@@ -26,11 +27,15 @@ visitor -> tnld visitor socket -> dedicated authenticated TCP transport
 ```
 
 `tnld` writes `TRANSPORT_ACTIVATION_MARKER` before application bytes so the waiting `tnlc`
-worker knows that its idle transport has been claimed. Each direction then carries four-byte
-big-endian lengths followed by up to 64 KiB of data; a zero length ends that direction. Once both
-directions finish cleanly, `tnld` returns the physical connection to the pool. The visitor byte
-stream is not striped across transports: one visitor TCP connection always retains one ordered
-data path.
+worker knows that its idle transport has been claimed. Payload then travels unframed. At EOF, each
+peer sends the exact number of bytes it wrote over the transport's persistent mux sideband. The
+receiver consumes exactly that many raw bytes and acknowledges the boundary. Once both directions
+finish, `tnld` returns the data socket and sideband to the pool. The acknowledgement matters because
+the count and payload use different TCP connections; it prevents the next activation marker from
+overtaking the previous count.
+
+One visitor TCP connection always retains one ordered data path. Traffic is never striped across
+dedicated transports.
 
 The mux path remains as a bounded fallback when every dedicated transport is active.
 
@@ -90,8 +95,8 @@ on one session. It therefore cannot make a single flow use eight connections.
 ### Dedicated data transports
 
 For bulk traffic, mux framing, allocation, copying, flow control, and per-session scheduling are
-avoidable overhead. The second pass moves application bytes onto a claimed raw outer TLS stream;
-the mux connections continue to carry fallback traffic and tunnel control.
+avoidable overhead. Application bytes move over a claimed authenticated raw TCP connection. The
+mux connections carry tunnel control, boundary counts, acknowledgements, and fallback traffic.
 
 - Core transport type: [`core/src/transport.rs`](../../core/src/transport.rs)
 - Registration, authenticated ownership, FIFO assignment, and availability notification:
@@ -115,7 +120,7 @@ transport, then falls back to mux rather than blocking indefinitely.
 
 - Recommended and maximum sizes plus async availability:
   [`core/src/server/mod.rs`](../../core/src/server/mod.rs)
-- Client workers and framing: [`tnlc/src/tunnel.rs`](../../tnlc/src/tunnel.rs)
+- Client workers and sideband boundaries: [`tnlc/src/tunnel.rs`](../../tnlc/src/tunnel.rs)
 - Bounded wait and fallback: [`tnld/src/server/tunnel.rs`](../../tnld/src/server/tunnel.rs)
 
 Using only 32 persistent workers reduced c64 throughput because it also capped active dedicated
@@ -157,11 +162,11 @@ improve a workload that has only one active connection.
 
 ## Protocol versioning
 
-The client and server require `X-Tnl-Protocol-Version: 5` on tunnel and transport CONNECT
+The client and server require `X-Tnl-Protocol-Version: 6` on tunnel and transport CONNECT
 requests and responses. Missing or unsupported versions fail registration instead of silently
 selecting a legacy data path. The server still advertises the required pool sizes; these headers
-are mandatory in protocol v5. Dedicated transports are authenticated and bound to the registered
+are mandatory in protocol v6. Dedicated transports are authenticated and bound to the registered
 tunnel owner before entering the pool.
 
-Mux remains part of protocol v5 as a bounded fallback when all dedicated transports are active. It
-is not retained to support old peers.
+Mux remains part of protocol v6 for sidebands and as a bounded fallback when all dedicated
+transports are active. It is not retained to support old peers.

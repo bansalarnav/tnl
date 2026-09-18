@@ -1,9 +1,10 @@
 use std::{
+    collections::HashMap,
     error::Error,
     fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -19,18 +20,18 @@ use rustls_acme::{AcmeConfig, EventOk, caches::DirCache, is_tls_alpn_challenge};
 use sha2::{Digest, Sha256};
 use socket2::{SockRef, TcpKeepalive};
 use tnl::{
-    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, SessionConfig, TRANSPORT_ACTIVATION_MARKER,
-    TunnelId,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, SessionConfig, Stream, TRANSPORT_ACTIVATION_MARKER,
+    TRANSPORT_SIDEBAND_TAG_PREFIX, TunnelId,
     client::TunnelClient,
     protocol::{
-        ReusableTransportStream, TCP_DATA_CHALLENGE_LENGTH, TCP_DATA_PROOF_LENGTH,
+        SidebandTransportStream, TCP_DATA_CHALLENGE_LENGTH, TCP_DATA_PROOF_LENGTH,
         TCP_DATA_REGISTRATION_MAGIC, write_tcp_data_registration,
     },
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
     net::TcpStream,
-    sync::watch,
+    sync::{oneshot, watch},
     task::JoinSet,
     time::Instant,
 };
@@ -78,6 +79,58 @@ struct TunnelRegistration {
     url: String,
     control_session_count: usize,
     transport_pool_size: usize,
+}
+
+#[derive(Default)]
+struct SidebandRegistry {
+    senders: Mutex<HashMap<u64, oneshot::Sender<Stream>>>,
+}
+
+struct SidebandRegistration {
+    transport_id: u64,
+    registry: Arc<SidebandRegistry>,
+}
+
+impl SidebandRegistry {
+    fn register(
+        self: &Arc<Self>,
+        transport_id: u64,
+    ) -> Result<(oneshot::Receiver<Stream>, SidebandRegistration)> {
+        let (sender, receiver) = oneshot::channel();
+        let replaced = self
+            .senders
+            .lock()
+            .expect("sideband registry lock was poisoned")
+            .insert(transport_id, sender);
+        if replaced.is_some() {
+            bail!("tunnel server reused transport identifier {transport_id}");
+        }
+        Ok((
+            receiver,
+            SidebandRegistration {
+                transport_id,
+                registry: Arc::clone(self),
+            },
+        ))
+    }
+
+    fn dispatch(&self, transport_id: u64, stream: Stream) -> bool {
+        self.senders
+            .lock()
+            .expect("sideband registry lock was poisoned")
+            .remove(&transport_id)
+            .is_some_and(|sender| sender.send(stream).is_ok())
+    }
+}
+
+impl Drop for SidebandRegistration {
+    fn drop(&mut self) {
+        self.registry
+            .senders
+            .lock()
+            .expect("sideband registry lock was poisoned")
+            .remove(&self.transport_id);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -259,12 +312,14 @@ async fn run_control_session(
     let endpoint_tls = endpoint_tls
         .clone()
         .context("tunnel endpoint TLS was not initialized")?;
+    let sideband_registry = Arc::new(SidebandRegistry::default());
     let mut control_sessions = JoinSet::new();
     for client in clients {
         control_sessions.spawn(serve_control_session(
             client,
             endpoint_tls.clone(),
             forward.target,
+            Arc::clone(&sideband_registry),
         ));
     }
 
@@ -275,6 +330,7 @@ async fn run_control_session(
             tunnel_id.clone(),
             endpoint_tls.clone(),
             forward.target,
+            Arc::clone(&sideband_registry),
         ));
     }
 
@@ -307,13 +363,30 @@ async fn serve_transport_worker(
     tunnel_id: TunnelId,
     endpoint_tls: EndpointTls,
     target: SocketAddr,
+    sideband_registry: Arc<SidebandRegistry>,
 ) {
     loop {
-        match transport.open_transport(&tunnel_id).await {
-            Ok(mut stream) => log_forward_error(
-                serve_reusable_transport(&mut stream, endpoint_tls.clone(), target).await,
-                "reusable dedicated tunnel transport failed",
-            ),
+        match transport
+            .open_transport(&tunnel_id, &sideband_registry)
+            .await
+        {
+            Ok((mut stream, sideband, registration)) => {
+                let result = async {
+                    let mut sideband = sideband.await.context(
+                        "tunnel control sessions closed during data transport registration",
+                    )?;
+                    drop(registration);
+                    serve_reusable_transport(
+                        &mut stream,
+                        &mut sideband,
+                        endpoint_tls.clone(),
+                        target,
+                    )
+                    .await
+                }
+                .await;
+                log_forward_error(result, "reusable dedicated tunnel transport failed");
+            }
             Err(error) => {
                 if !is_routine_connection_error(&error) {
                     eprintln!("could not open reusable dedicated tunnel transport: {error:#}");
@@ -326,6 +399,7 @@ async fn serve_transport_worker(
 
 async fn serve_reusable_transport(
     stream: &mut TcpStream,
+    sideband: &mut Stream,
     endpoint_tls: EndpointTls,
     target: SocketAddr,
 ) -> Result<()> {
@@ -339,13 +413,11 @@ async fn serve_reusable_transport(
             bail!("tunnel server sent an invalid transport activation marker");
         }
 
-        let mut visitor_transport = ReusableTransportStream::new(&mut *stream);
+        let mut visitor_transport = SidebandTransportStream::new(&mut *stream, &mut *sideband);
         forward_connection(&mut visitor_transport, endpoint_tls.clone(), target).await?;
         tokio::io::copy(&mut visitor_transport, &mut tokio::io::sink()).await?;
         visitor_transport.shutdown().await?;
-        if !visitor_transport.is_finished() {
-            bail!("reusable dedicated transport did not finish cleanly");
-        }
+        visitor_transport.finish().await?;
     }
 }
 
@@ -353,10 +425,22 @@ async fn serve_control_session(
     client: TunnelClient,
     endpoint_tls: EndpointTls,
     target: SocketAddr,
+    sideband_registry: Arc<SidebandRegistry>,
 ) -> Result<()> {
     let mut connection_tasks = JoinSet::new();
     loop {
         let mut tunnel_stream = client.accept().await?;
+        if let Some(transport_id) = tunnel_stream
+            .tag()
+            .strip_prefix(TRANSPORT_SIDEBAND_TAG_PREFIX)
+        {
+            let transport_id = u64::from_str_radix(transport_id, 16)
+                .context("tunnel server sent an invalid sideband transport identifier")?;
+            if !sideband_registry.dispatch(transport_id, tunnel_stream) {
+                bail!("tunnel server sent a sideband for unknown transport {transport_id}");
+            }
+            continue;
+        }
         if tunnel_stream.tag() != TCP_FORWARD_TAG {
             eprintln!("ignoring unsupported stream tag: {}", tunnel_stream.tag());
             continue;
@@ -507,7 +591,11 @@ impl HttpTransport {
         })
     }
 
-    async fn open_transport(&self, tunnel_id: &TunnelId) -> Result<TcpStream> {
+    async fn open_transport(
+        &self,
+        tunnel_id: &TunnelId,
+        sideband_registry: &Arc<SidebandRegistry>,
+    ) -> Result<(TcpStream, oneshot::Receiver<Stream>, SidebandRegistration)> {
         let mut stream = self.open_tcp().await?;
         write_tcp_data_registration(&mut stream, tunnel_id).await?;
 
@@ -534,7 +622,11 @@ impl HttpTransport {
         if stream.read_u8().await? != 0 {
             bail!("tunnel server rejected a TCP data registration");
         }
-        Ok(stream)
+        let transport_id = stream.read_u64().await?;
+        let (sidebands, registration) = sideband_registry.register(transport_id)?;
+        stream.write_u8(0).await?;
+        stream.flush().await?;
+        Ok((stream, sidebands, registration))
     }
 
     async fn open_tcp(&self) -> Result<TcpStream> {
@@ -747,8 +839,8 @@ mod tests {
 
     #[test]
     fn requires_current_protocol_version() {
-        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 5\r\n").is_ok());
-        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 4\r\n").is_err());
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 6\r\n").is_ok());
+        assert!(validate_protocol_version("X-Tnl-Protocol-Version: 5\r\n").is_err());
         assert!(validate_protocol_version("").is_err());
     }
 

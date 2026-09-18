@@ -20,7 +20,7 @@ pub mod server;
 pub use protocol::TunnelId;
 
 /// HTTP transport protocol version required by this release.
-pub const PROTOCOL_VERSION: &str = "5";
+pub const PROTOCOL_VERSION: &str = "6";
 
 /// HTTP header carrying the tunnel protocol version in both directions.
 pub const PROTOCOL_VERSION_HEADER: &str = "X-Tnl-Protocol-Version";
@@ -33,7 +33,11 @@ pub use transport::Transport;
 
 #[cfg(any(feature = "client", feature = "server"))]
 /// Marker sent when an idle dedicated transport is assigned application data.
-pub const TRANSPORT_ACTIVATION_MARKER: &[u8; 4] = b"TNL\x05";
+pub const TRANSPORT_ACTIVATION_MARKER: &[u8; 4] = b"TNL\x06";
+
+#[cfg(any(feature = "client", feature = "server"))]
+/// Stream-tag prefix used to pair a raw data transport with its boundary stream.
+pub const TRANSPORT_SIDEBAND_TAG_PREFIX: &str = "tnl/sideband/";
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub use session::SessionConfig;
