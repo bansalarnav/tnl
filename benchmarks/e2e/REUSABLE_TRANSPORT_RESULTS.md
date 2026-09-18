@@ -26,3 +26,35 @@ Inline framing produced the largest fresh-connection gain but caused a clear c1 
 regression. Sideband reuse recovers most established-stream throughput and still improves fresh
 connections over v4, though its boundary handshake gives up part of v5's churn gain. Any payload,
 sideband, or byte-count error retires the carrier rather than risking the next visitor stream.
+
+## Emulated WAN
+
+The loopback result is not representative of the `tnlc` to `tnld` link in normal deployments. A
+user-space TCP proxy was therefore placed on that hop while the visitor and backend remained local.
+Each result is the median of three paired runs. The `wan30` profile uses 30 ms RTT, 2 ms one-way
+jitter, 30 ms connection setup, and a shared 200 Mbit/s limit. `wan100` uses 100 ms RTT, 5 ms jitter,
+100 ms connection setup, and a shared 50 Mbit/s limit.
+
+| Profile and case | v4 single-use | v6 sideband reuse | Change |
+| --- | ---: | ---: | ---: |
+| WAN30, fresh c8 | 105.1 req/s | 113.7 req/s | +8.2% |
+| WAN30, 1 KiB c32 | 914.5 req/s | 918.7 req/s | +0.5% |
+| WAN30, 1 MiB c1 | 106.1 Mbit/s | 106.9 Mbit/s | +0.7% |
+| WAN30, 1 MiB c16 | 194.9 Mbit/s | 195.5 Mbit/s | +0.3% |
+| WAN30, 1 MiB c64 | 196.1 Mbit/s | 196.5 Mbit/s | +0.2% |
+| WAN100, fresh c8 | 36.70 req/s | 37.15 req/s | +1.2% |
+| WAN100, 1 KiB c32 | 294.9 req/s | 295.7 req/s | +0.3% |
+| WAN100, 1 MiB c1 | 29.61 Mbit/s | 29.42 Mbit/s | -0.7% |
+| WAN100, 1 MiB c16 | 48.20 Mbit/s | 48.20 Mbit/s | 0.0% |
+| WAN100, 1 MiB c64 | 48.55 Mbit/s, 65.2% success | 49.08 Mbit/s, 100% success | +1.1% throughput |
+
+The old WAN100 c64 runs timed out exactly 32 requests in every repetition. Their latency numbers
+have survivorship bias and are not directly comparable with v6, which completed every request.
+This also uncovered and fixed benchmark accounting that had multiplied attempted request rate by
+response size: failed requests could previously report payload that was never received.
+
+The WAN runs do not reveal a broad throughput win. Reuse gives a modest fresh-connection improvement
+and, under sustained pressure above the 32-carrier pool, replaces timeouts with queued completion.
+That makes it primarily a churn and overload-reliability change rather than a steady-state throughput
+optimization. The proxy does not emulate loss or TCP retransmission; those require `tc netem` or two
+physical hosts.

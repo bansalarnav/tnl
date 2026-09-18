@@ -53,6 +53,44 @@ benchmarks/e2e/run.sh \
 
 `TUNNEL_CONNECT_TO` is optional. It makes visitor connections enter `tnld` over loopback while preserving the tunnel hostname for SNI and certificate verification. This removes an accidental public-IP hairpin from the visitor side. It does not alter the persistent `tnld` to `tnlc` control connection.
 
+## Emulated tunnel links
+
+`link_proxy.js` adds latency, jitter, connection-setup delay, and an optional aggregate bandwidth
+limit. To isolate the link affected by a tunnel implementation change, point `tnlc`'s
+`connect_addr` at the proxy while its API URL and visitor traffic continue to use `tnld` directly:
+
+```sh
+# tnld listens on 127.0.0.1:8443. The proxy listens on 9443.
+node benchmarks/e2e/link_proxy.js wan30
+
+# tnlc configuration
+{
+  "api_url": "https://tnl.example:8443",
+  "connect_addr": "127.0.0.1:9443"
+}
+```
+
+For absolute end-to-end latency, run a second proxy for the visitor-to-`tnld` hop and point
+`TUNNEL_CONNECT_TO` at it:
+
+```sh
+LINK_LISTEN_PORT=10443 node benchmarks/e2e/link_proxy.js wan30
+
+TUNNEL_CONNECT_TO='<tunnel-host>:8443:127.0.0.1:10443' \
+benchmarks/e2e/run.sh \
+  http://127.0.0.1:18080 \
+  https://<tunnel-host>:8443
+```
+
+Named profiles are `loopback`, `lan`, `wan30`, and `wan100`. `wan30` models a 30 ms RTT,
+2 ms one-way jitter, a 30 ms TCP setup cost, and a 200 Mbit/s link. `wan100` uses a 100 ms RTT
+and 50 Mbit/s. Override individual settings with `LINK_DELAY_MS`, `LINK_JITTER_MS`,
+`LINK_CONNECT_DELAY_MS`, and `LINK_BANDWIDTH_MBPS`.
+
+This is a TCP byte-stream proxy. It models propagation, setup, and serialization delay without
+root access. It cannot model packet loss or retransmission correctly. Use `tc netem` or two hosts
+for loss tests. Dropping bytes in this proxy would corrupt TCP rather than trigger TCP recovery.
+
 The default matrix covers 1-byte, 1 KiB, 64 KiB, 1 MiB, and 8 MiB responses. It exercises downloads,
 uploads, and simultaneous upload/download work at concurrency levels from 1 through 192. The fresh
 connection case sends a fixed 2,000 requests so it does not exhaust the benchmark host's ephemeral
@@ -83,9 +121,11 @@ Raw `oha` JSON, `summary.csv`, `aggregate.csv`, and `processes.csv` are written 
 the minimum success rate, and the total error count for each path and case.
 Every summary row contains completed responses, errors, elapsed time, request rate, response latency,
 time to first byte, success rate, and request/response payload throughput. Payload throughput excludes
-HTTP framing and TLS overhead. CPU is reported as a percentage of one core, and memory is the peak
-resident set sampled during each case. Process sampling currently requires Linux `/proc`; request and
-network measurements work on Linux and macOS.
+HTTP framing and TLS overhead. Response throughput uses the bytes actually received, so timeouts do
+not inflate it. Request throughput is an estimate based on attempted requests and configured body
+size. CPU is reported as a percentage of one core, and memory is the peak resident set sampled during
+each case. Process sampling currently requires Linux `/proc`; request and network measurements work
+on Linux and macOS.
 
 Recorded optimization studies:
 
@@ -95,4 +135,5 @@ Recorded optimization studies:
 - [Second pass](ROUND2_RESULTS.md): dedicated data transports, adaptive mux fallback, uploads, and the full checkpoint matrix.
 - [Raw TCP comparison](RAW_TCP_RESULTS.md): outer TLS versus authenticated raw data sockets.
 - [Reusable transport comparison](REUSABLE_TRANSPORT_RESULTS.md): protocol v4 single-use versus
-  protocol v5 recycled dedicated transports.
+  protocol v5 framed and protocol v6 sideband-recycled dedicated transports, including emulated WAN
+  results.

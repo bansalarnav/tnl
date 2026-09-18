@@ -169,9 +169,9 @@ run_case() {
        (.details.firstByte.average * 1000),
        (.firstBytePercentiles.p50 * 1000), (.firstBytePercentiles.p95 * 1000),
        (.firstBytePercentiles.p99 * 1000), .summary.successRate,
-       (.summary.requestsPerSec * ($response_size | tonumber) * 8 / 1000000),
+       (.summary.sizePerSec * 8 / 1000000),
        (.summary.requestsPerSec * ($request_size | tonumber) * 8 / 1000000),
-       (.summary.requestsPerSec * (($response_size | tonumber) + ($request_size | tonumber)) * 8 / 1000000)
+       ((.summary.sizePerSec + (.summary.requestsPerSec * ($request_size | tonumber))) * 8 / 1000000)
      ] | @csv' \
     "$output" >> "$summary_csv"
 
