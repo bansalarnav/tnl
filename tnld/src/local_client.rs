@@ -4,12 +4,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::config::{Client, Config};
+use crate::config::{Config, hash_token};
 
 const LOCAL_CLIENT_NAME: &str = "tnld-local";
 
@@ -31,23 +28,7 @@ pub fn ensure() -> Result<()> {
         return Ok(());
     }
 
-    let mut token_bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut token_bytes);
-    let token = URL_SAFE_NO_PAD.encode(token_bytes);
-    let token_hash = hash_token(&token);
-
-    if let Some(client) = server_config
-        .clients
-        .iter_mut()
-        .find(|client| client.name == LOCAL_CLIENT_NAME)
-    {
-        client.token_hash = token_hash;
-    } else {
-        server_config.clients.push(Client {
-            name: LOCAL_CLIENT_NAME.to_owned(),
-            token_hash,
-        });
-    }
+    let token = server_config.issue_token(LOCAL_CLIENT_NAME);
     server_config.write()?;
 
     write_client_config(
@@ -108,8 +89,4 @@ fn client_config_path() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("could not determine the home directory")?
         .join(".tnl/config.json"))
-}
-
-fn hash_token(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
 }

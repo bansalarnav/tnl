@@ -75,7 +75,7 @@ import sys
 
 packages = {package["name"]: package["version"] for package in json.load(sys.stdin)["packages"]}
 expected = os.environ["VERSION"]
-for name in ("tnl-core", "tnlc", "tnld"):
+for name in ("tnl-core", "tnl-node", "tnl-relay", "tnlc", "tnld"):
     if packages.get(name) != expected:
         raise SystemExit(f"{name} version is {packages.get(name)}, expected {expected}")
 '

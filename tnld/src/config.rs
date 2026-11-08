@@ -5,7 +5,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
@@ -22,7 +25,27 @@ pub struct Client {
     pub token_hash: String,
 }
 
+pub fn hash_token(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
 impl Config {
+    /// Creates or replaces client `name` and returns its new API token.
+    pub fn issue_token(&mut self, name: &str) -> String {
+        let mut token = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut token);
+        let token = URL_SAFE_NO_PAD.encode(token);
+        let token_hash = hash_token(&token);
+        match self.clients.iter_mut().find(|client| client.name == name) {
+            Some(client) => client.token_hash = token_hash,
+            None => self.clients.push(Client {
+                name: name.to_owned(),
+                token_hash,
+            }),
+        }
+        token
+    }
+
     pub fn api_url(&self) -> String {
         let port = match self.listen_port {
             443 => String::new(),
@@ -67,13 +90,6 @@ impl Config {
         let json = serde_json::to_string_pretty(self).context("could not serialize config")?;
         fs::write(&path, format!("{json}\n"))
             .with_context(|| format!("could not write config to {}", path.display()))
-    }
-
-    pub fn update(update: impl FnOnce(&mut Self)) -> Result<Self> {
-        let mut config = Self::get()?;
-        update(&mut config);
-        config.write()?;
-        Ok(config)
     }
 }
 

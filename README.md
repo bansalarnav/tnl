@@ -84,11 +84,19 @@ sudo journalctl -u tnld.service -f
 
 ## Project structure
 
-The workspace contains three packages:
+The relay and node are libraries, so tunnels can be embedded in other programs. The command-line
+tools are thin wrappers around them.
 
-- `tnl-core` in `core/` (imported as `tnl`): transport-neutral tunnel sessions and connection pairing
-- `tnlc`: the command-line client, including authenticated raw TCP transport, ACME, and optional pooled HTTP origin forwarding
-- `tnld`: the command-line server, including authentication, HTTP upgrades, TLS, SNI routing, and public forwarding
+- `tnl-core` in `core/`: the wire protocol, multiplexed control sessions, and data transport
+  handshake shared by both sides
+- `tnl-relay` in `relay/`: the public relay. It serves the registration API, routes visitors by TLS
+  server name without decrypting them, and pools nodes' data transports. Authentication and TLS
+  certificates are supplied by the embedder.
+- `tnl-node` in `node/`: registers a tunnel, keeps it connected, and hands each visitor connection
+  to a `Handler`. `ForwardTls` is a handler that obtains a Let's Encrypt certificate through the
+  tunnel and forwards to a local port.
+- `tnld`: the server command. It adds config files, client invitations, and ACME for the API hostname.
+- `tnlc`: the client command
 
 ## Limitations
 
