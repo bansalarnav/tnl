@@ -1,5 +1,5 @@
 mod config;
-mod tunnel;
+mod expose;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -28,8 +28,14 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .without_time()
+        .with_target(false)
+        .init();
+
     match Cli::parse().command {
         Command::Login { blob } => config::login(&blob),
-        Command::Expose { port, name } => tunnel::expose(port, name).await,
+        Command::Expose { port, name } => expose::run(port, name).await,
     }
 }

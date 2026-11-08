@@ -2,25 +2,13 @@
 name = "tnl-core"
 version.workspace = true
 edition = "2024"
-description = "Embeddable client and server for end-to-end encrypted tunnels"
-
-[lib]
-name = "tnl"
-
-[features]
-default = []
-client = [
-    "dep:async-trait",
-    "dep:muxado",
-    "dep:tokio",
-]
-server = [
-    "dep:async-trait",
-    "dep:muxado",
-    "dep:tokio",
-]
+description = "Wire protocol and multiplexed sessions shared by tnl relays and nodes"
 
 [dependencies]
-async-trait = { version = "0.1.89", optional = true }
-muxado = { version = "0.5.4", optional = true }
-tokio = { version = "1.50.0", features = ["io-util", "macros", "rt", "sync", "time"], optional = true }
+async-trait = "0.1.89"
+hmac = "0.12.1"
+muxado = "0.5.4"
+rustls = { version = "0.23.42", default-features = false, features = ["std"] }
+sha2 = "0.10.9"
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio = { version = "1.50.0", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
