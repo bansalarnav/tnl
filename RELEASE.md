@@ -17,4 +17,6 @@ The workflow verifies that the tag matches all three Cargo package versions, pin
 - macOS x86_64
 - macOS ARM64
 
+It also builds the client (`tnlc.exe`) for Windows x86_64, packaged as `tnl-v<version>-windows-x86_64.zip`. The server is not built for Windows because its background process management uses Unix APIs.
+
 After every build succeeds, it attaches the archives and `SHA256SUMS`, creates the Git tag, and publishes the draft. If a build fails, the draft remains unpublished. Rerun `./release` with the same version after fixing and merging the problem.
