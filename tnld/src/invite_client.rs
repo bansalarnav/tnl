@@ -1,10 +1,8 @@
 use anyhow::{Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
-use crate::config::{Client, Config};
+use crate::config::Config;
 
 const LOGIN_BLOB_PREFIX: &str = "tnl-login-v1.";
 
@@ -21,19 +19,7 @@ pub fn run(name: &str) -> Result<()> {
     }
 
     let mut config = Config::get()?;
-    let mut token_bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut token_bytes);
-    let token = URL_SAFE_NO_PAD.encode(token_bytes);
-    let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-
-    if let Some(client) = config.clients.iter_mut().find(|client| client.name == name) {
-        client.token_hash = token_hash;
-    } else {
-        config.clients.push(Client {
-            name: name.to_owned(),
-            token_hash,
-        });
-    }
+    let token = config.issue_token(name);
     config.write()?;
 
     let payload = LoginPayload {

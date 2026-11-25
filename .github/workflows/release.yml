@@ -48,10 +48,10 @@ jobs:
           VERSION="${TAG_NAME#v}"
           VERSIONS_MATCH=$(cargo metadata --locked --no-deps --format-version 1 | jq \
             --arg version "${VERSION}" \
-            '[.packages[] | select(.name == "tnl-core" or .name == "tnlc" or .name == "tnld") | .version] as $versions | ($versions | length == 3) and ($versions | all(. == $version))')
+            '[.packages[] | .version] | all(. == $version)')
 
           if [[ "${VERSIONS_MATCH}" != "true" ]]; then
-            echo "Release ${VERSION} must match the version of tnl-core, tnlc, and tnld."
+            echo "Release ${VERSION} must match the version of every workspace package."
             exit 1
           fi
 

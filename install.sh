@@ -287,13 +287,6 @@ EOF
   # is idempotent once the local connection has been configured.
   run_as_service_user setup-client
 
-  if [ -f "$service_home/.tnld/server.pid" ]; then
-    echo "Stopping the previous background server..."
-    if ! run_as_service_user stop; then
-      echo "The previous PID was stale; continuing with systemd."
-    fi
-  fi
-
   run_privileged systemctl enable tnld.service
   run_privileged systemctl restart tnld.service
   echo "Started the tnld system service."

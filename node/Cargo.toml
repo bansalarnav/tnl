@@ -1,0 +1,23 @@
+[package]
+name = "tnl-node"
+version.workspace = true
+edition = "2024"
+description = "Embeddable node that serves tnl tunnels through a relay"
+
+[dependencies]
+anyhow = "1.0.104"
+rand = "0.8.5"
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-acme = { version = "0.15.4", default-features = false, features = ["ring", "tls12", "tokio", "webpki-roots"] }
+tnl-core = { path = "../core" }
+tokio = { version = "1.50.0", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tokio-stream = "0.1.18"
+tracing = "0.1.44"
+url = "2.5.8"
+webpki-roots = "1.0.6"
+
+[dev-dependencies]
+rcgen = "0.13.2"
+tnl-relay = { path = "../relay" }
+tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
