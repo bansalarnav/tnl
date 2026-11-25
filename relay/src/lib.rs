@@ -36,9 +36,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
-use tnl_core::{SessionConfig, TunnelId, data_transport, net};
+use tnl_core::{SessionConfig, TunnelId, net};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
     task::JoinSet,
     time::timeout,
@@ -155,11 +155,19 @@ impl Relay {
     /// Accepts and handles connections until accepting fails. Dropping the
     /// returned future drops every connection it accepted.
     pub async fn serve(&self, listener: TcpListener) -> io::Result<()> {
+        let (inherited_nodelay, inherited_keepalive) = net::configure_tcp_listener(&listener);
         let mut connections = JoinSet::new();
         loop {
             let (stream, peer) = listener.accept().await?;
-            if let Err(error) = net::configure_tcp_stream(&stream) {
-                warn!(%peer, "could not configure TCP socket: {error}");
+            if !inherited_nodelay
+                && let Err(error) = stream.set_nodelay(true)
+            {
+                warn!(%peer, "could not disable Nagle's algorithm: {error}");
+            }
+            if !inherited_keepalive
+                && let Err(error) = net::configure_tcp_keepalive(&stream)
+            {
+                warn!(%peer, "could not configure TCP keepalive: {error}");
             }
             while connections.try_join_next().is_some() {}
             connections.spawn(
@@ -188,59 +196,51 @@ impl Relay {
         self.inner.registry.shutdown();
     }
 
-    async fn route<S>(&self, mut stream: S) -> Result<()>
+    async fn route<S>(&self, stream: S) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let first_byte = stream
-            .read_u8()
-            .await
-            .context("could not read the connection preface")?;
-        if first_byte == data_transport::PREFACE_BYTE {
-            return timeout(
+        match tls::inspect_connection(stream, &self.inner.domain).await? {
+            None => Ok(()),
+            Some(tls::InspectedConnection::DataTransport { prefix, stream }) => timeout(
                 DATA_TRANSPORT_TIMEOUT,
-                data::accept(self, stream, first_byte),
+                data::accept(self, stream, prefix.as_slice()),
             )
             .await
-            .context("timed out adding a data transport")?;
-        }
-        if first_byte != tls::HANDSHAKE_RECORD {
-            stream.shutdown().await?;
-            return Ok(());
-        }
-
-        let hello = tls::read_client_hello(stream, first_byte).await?;
-        let Some(server_name) = hello.server_name() else {
-            return Ok(());
-        };
-
-        if server_name == self.inner.domain {
-            if hello.is_acme_challenge()
-                && let Some(config) = &self.inner.acme_challenge_tls
-            {
-                let mut stream = hello.terminate(Arc::clone(config)).await?;
-                stream.shutdown().await?;
-                return Ok(());
+            .context("timed out adding a data transport")?,
+            Some(tls::InspectedConnection::Api(hello)) => {
+                if hello.is_acme_challenge()
+                    && let Some(config) = &self.inner.acme_challenge_tls
+                {
+                    let mut stream = hello.terminate(Arc::clone(config)).await?;
+                    stream.shutdown().await?;
+                    return Ok(());
+                }
+                let stream = hello.terminate(Arc::clone(&self.inner.api_tls)).await?;
+                api::serve(self.clone(), stream).await
             }
-            let stream = hello.terminate(Arc::clone(&self.inner.api_tls)).await?;
-            return api::serve(self.clone(), stream).await;
+            Some(tls::InspectedConnection::Tunnel(hello)) => {
+                let Some(tunnel_id) = hello
+                    .server_name()
+                    .strip_suffix(&self.inner.tunnel_suffix)
+                    .and_then(|name| TunnelId::new(name).ok())
+                else {
+                    debug!(
+                        server_name = hello.server_name(),
+                        "no tunnel for server name"
+                    );
+                    return Ok(());
+                };
+                let (prefixed_hello, mut visitor) = hello.into_parts();
+                forward::forward(
+                    &self.inner.registry,
+                    &tunnel_id,
+                    &prefixed_hello,
+                    &mut visitor,
+                )
+                .await
+            }
         }
-
-        let Some(tunnel_id) = server_name
-            .strip_suffix(&self.inner.tunnel_suffix)
-            .and_then(|name| TunnelId::new(name).ok())
-        else {
-            debug!(server_name, "no tunnel for server name");
-            return Ok(());
-        };
-        let (client_hello, mut visitor) = hello.into_parts();
-        forward::forward(
-            &self.inner.registry,
-            &tunnel_id,
-            &client_hello,
-            &mut visitor,
-        )
-        .await
     }
 
     fn tunnel_url(&self, tunnel_id: &TunnelId) -> String {

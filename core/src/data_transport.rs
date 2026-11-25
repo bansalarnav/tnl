@@ -65,9 +65,13 @@ where
     let name = tunnel_id.as_str().as_bytes();
     let name_length = u8::try_from(name.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tunnel name is too long"))?;
-    stream.write_all(MAGIC).await?;
-    stream.write_u8(name_length).await?;
-    stream.write_all(name).await?;
+    // Coalesce MAGIC + length + tunnel name into one write / TCP segment.
+    let mut header = [0_u8; MAGIC.len() + 1 + 255];
+    header[..MAGIC.len()].copy_from_slice(MAGIC);
+    header[MAGIC.len()] = name_length;
+    let total = MAGIC.len() + 1 + name.len();
+    header[MAGIC.len() + 1..total].copy_from_slice(name);
+    stream.write_all(&header[..total]).await?;
     stream.flush().await?;
 
     let mut challenge = [0; CHALLENGE_LENGTH];
@@ -100,18 +104,38 @@ pub async fn read_request<S>(stream: &mut S, first_byte: u8) -> io::Result<Tunne
 where
     S: AsyncRead + Unpin,
 {
-    let mut magic = [0; MAGIC.len()];
-    magic[0] = first_byte;
-    stream.read_exact(&mut magic[1..]).await?;
-    if &magic != MAGIC {
+    read_request_with_prefix(stream, &[first_byte]).await
+}
+
+/// Relay side: reads the tunnel a data transport is for, consuming `prefix`
+/// bytes already read from `stream` (starting with [`PREFACE_BYTE`]).
+pub async fn read_request_with_prefix<S>(stream: &mut S, prefix: &[u8]) -> io::Result<TunnelId>
+where
+    S: AsyncRead + Unpin,
+{
+    const HEADER_LEN: usize = MAGIC.len() + 1;
+    let mut header = [0_u8; HEADER_LEN];
+    let header_from_prefix = prefix.len().min(HEADER_LEN);
+    header[..header_from_prefix].copy_from_slice(&prefix[..header_from_prefix]);
+    if header_from_prefix < HEADER_LEN {
+        stream.read_exact(&mut header[header_from_prefix..]).await?;
+    }
+    if &header[..MAGIC.len()] != MAGIC {
         return Err(invalid_data("invalid data transport magic"));
     }
-    let name_length = stream.read_u8().await? as usize;
+    let name_length = header[MAGIC.len()] as usize;
     if name_length == 0 {
         return Err(invalid_data("empty tunnel name"));
     }
+    let trailing = &prefix[header_from_prefix..];
+    if trailing.len() > name_length {
+        return Err(invalid_data("unexpected bytes after data transport request"));
+    }
     let mut name = vec![0; name_length];
-    stream.read_exact(&mut name).await?;
+    name[..trailing.len()].copy_from_slice(trailing);
+    if trailing.len() < name_length {
+        stream.read_exact(&mut name[trailing.len()..]).await?;
+    }
     let name = String::from_utf8(name).map_err(|_| invalid_data("tunnel name is not UTF-8"))?;
     TunnelId::new(name).map_err(|_| invalid_data("invalid tunnel name"))
 }
@@ -152,8 +176,10 @@ pub async fn assign<S>(stream: &mut S, transport_id: u64) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    stream.write_u8(ACCEPTED).await?;
-    stream.write_u64(transport_id).await?;
+    let mut message = [0_u8; 1 + size_of::<u64>()];
+    message[0] = ACCEPTED;
+    message[1..].copy_from_slice(&transport_id.to_be_bytes());
+    stream.write_all(&message).await?;
     stream.flush().await?;
     if stream.read_u8().await? != ACCEPTED {
         return Err(invalid_data("node rejected the data transport identifier"));

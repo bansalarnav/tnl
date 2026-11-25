@@ -3,21 +3,40 @@
 use std::{error::Error, io, time::Duration};
 
 use socket2::{SockRef, TcpKeepalive};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
+fn keepalive_params() -> TcpKeepalive {
+    TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES)
+}
+
+/// Applies `TCP_NODELAY` and TCP keepalive to `listener` so accepted sockets
+/// inherit them on platforms that support inheritance (such as Linux), avoiding
+/// per-connection `setsockopt` syscalls.
+///
+/// Returns `(nodelay_inherited, keepalive_inherited)`.
+pub fn configure_tcp_listener(listener: &TcpListener) -> (bool, bool) {
+    let sock = SockRef::from(listener);
+    let nodelay = sock.set_tcp_nodelay(true).is_ok();
+    let keepalive = sock.set_tcp_keepalive(&keepalive_params()).is_ok();
+    (nodelay, keepalive)
+}
+
 /// Disables Nagle's algorithm and enables TCP keepalive.
 pub fn configure_tcp_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
-    SockRef::from(stream).set_tcp_keepalive(
-        &TcpKeepalive::new()
-            .with_time(TCP_KEEPALIVE_IDLE)
-            .with_interval(TCP_KEEPALIVE_INTERVAL)
-            .with_retries(TCP_KEEPALIVE_RETRIES),
-    )
+    configure_tcp_keepalive(stream)
+}
+
+/// Enables TCP keepalive on `stream`.
+pub fn configure_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {
+    SockRef::from(stream).set_tcp_keepalive(&keepalive_params())
 }
 
 /// Returns whether `error` or any of its sources is an ordinary disconnect or

@@ -11,16 +11,23 @@ use std::{
 use tnl_core::{
     Opener, Session, SessionConfig, SessionError, Stream, TunnelId,
     data_transport::TransportKey,
-    protocol::{MAX_CONTROL_SESSIONS, MAX_DATA_TRANSPORTS},
+    protocol::{
+        DEFAULT_DATA_TRANSPORTS, DEMAND_TAG, MAX_CONTROL_SESSIONS, MAX_DATA_TRANSPORTS,
+        MAX_IDLE_RETAINED_TRANSPORTS,
+    },
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::{Notify, watch},
     time::{Instant, timeout_at},
 };
 use tracing::debug;
 
 use crate::ClientId;
+
+/// Excess idle data transports above [`DEFAULT_DATA_TRANSPORTS`] that stay
+/// unused for this long are closed so post-burst idle pools shrink back to 8.
+const IDLE_SHRINK_AGE: Duration = Duration::from_secs(15);
 
 pub(crate) trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -32,6 +39,7 @@ pub(crate) struct DataTransport {
     pub data: Box<dyn Io>,
     pub sideband: Stream,
     generation: u64,
+    recycled_at: Instant,
 }
 
 /// Credentials a node must prove to attach data transports to a tunnel.
@@ -64,6 +72,10 @@ struct Tunnel {
     next_session: usize,
     transports: VecDeque<DataTransport>,
     transport_available: Arc<Notify>,
+    /// Number of visitors currently blocked waiting for a data transport.
+    waiting_visitors: usize,
+    demand_notify: Arc<Notify>,
+    idle_trim_scheduled: bool,
     /// Set once the node has supplied a data transport. From then on, visitors
     /// briefly wait for one instead of falling back to a session stream.
     prefers_transports: bool,
@@ -101,6 +113,8 @@ impl Registry {
         }
         let session_id = state.next_session_id;
         state.next_session_id += 1;
+        let is_new_tunnel = !state.tunnels.contains_key(&tunnel_id);
+        let demand_notify = Arc::new(Notify::new());
         let tunnel = state
             .tunnels
             .entry(tunnel_id.clone())
@@ -112,12 +126,25 @@ impl Registry {
                 next_session: 0,
                 transports: VecDeque::new(),
                 transport_available: Arc::new(Notify::new()),
+                waiting_visitors: 0,
+                demand_notify: Arc::clone(&demand_notify),
+                idle_trim_scheduled: false,
                 prefers_transports: false,
             });
         if tunnel.owner != owner || tunnel.sessions.len() >= MAX_CONTROL_SESSIONS {
             return Err(RegisterError::AlreadyRegistered);
         }
+        let generation = tunnel.generation;
         tunnel.sessions.push((session_id, session.opener()));
+        drop(state);
+        if is_new_tunnel {
+            tokio::spawn(run_demand_notifier(
+                self.clone(),
+                tunnel_id.clone(),
+                generation,
+                demand_notify,
+            ));
+        }
         Ok(Registration {
             registry: self.clone(),
             tunnel_id,
@@ -183,8 +210,9 @@ impl Registry {
             data: Box::new(data),
             sideband,
             generation,
+            recycled_at: Instant::now(),
         });
-        tunnel.transport_available.notify_waiters();
+        tunnel.transport_available.notify_one();
         Ok(())
     }
 
@@ -203,17 +231,41 @@ impl Registry {
             .and_then(|tunnel| tunnel.transports.pop_front())
     }
 
-    /// Takes the oldest idle data transport, waiting up to `wait` for one.
+    /// Takes the most recently used idle data transport, waiting up to `wait` for one.
     pub async fn take_transport_within(
         &self,
         tunnel_id: &TunnelId,
         wait: Duration,
     ) -> Option<DataTransport> {
-        let available = self
-            .state()
-            .tunnels
-            .get(tunnel_id)
-            .map(|tunnel| Arc::clone(&tunnel.transport_available))?;
+        let (available, demand_notify) = {
+            let mut state = self.state();
+            let tunnel = state.tunnels.get_mut(tunnel_id)?;
+            if let Some(transport) = tunnel.transports.pop_front() {
+                return Some(transport);
+            }
+            tunnel.waiting_visitors = tunnel.waiting_visitors.saturating_add(1);
+            let available = Arc::clone(&tunnel.transport_available);
+            let demand_notify = Arc::clone(&tunnel.demand_notify);
+            (available, demand_notify)
+        };
+
+        struct WaiterGuard<'a> {
+            registry: &'a Registry,
+            tunnel_id: &'a TunnelId,
+        }
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(tunnel) = self.registry.state().tunnels.get_mut(self.tunnel_id) {
+                    tunnel.waiting_visitors = tunnel.waiting_visitors.saturating_sub(1);
+                }
+            }
+        }
+        let _waiter = WaiterGuard {
+            registry: self,
+            tunnel_id,
+        };
+        demand_notify.notify_one();
+
         let deadline = Instant::now() + wait;
         loop {
             let notified = available.notified();
@@ -228,25 +280,47 @@ impl Registry {
         }
     }
 
-    /// Returns a data transport whose visitor finished cleanly to its pool.
-    pub fn recycle_transport(&self, tunnel_id: &TunnelId, transport: DataTransport) {
-        let mut state = self.state();
-        let Some(tunnel) = state.tunnels.get_mut(tunnel_id) else {
-            return;
-        };
-        if transport.generation != tunnel.generation
-            || tunnel.transports.len() >= MAX_DATA_TRANSPORTS
+    /// Returns a data transport whose visitor finished cleanly to the front of
+    /// its pool (LIFO, preserving warm TCP congestion windows). Drops excess
+    /// transports once `MAX_IDLE_RETAINED_TRANSPORTS` are already idle and
+    /// schedules a delayed trim back down to `DEFAULT_DATA_TRANSPORTS` once the
+    /// burst subsides.
+    pub fn recycle_transport(&self, tunnel_id: &TunnelId, mut transport: DataTransport) {
+        let mut schedule_trim = None;
         {
-            return;
+            let mut state = self.state();
+            let Some(tunnel) = state.tunnels.get_mut(tunnel_id) else {
+                return;
+            };
+            if transport.generation != tunnel.generation
+                || tunnel.transports.len() >= MAX_IDLE_RETAINED_TRANSPORTS
+            {
+                return;
+            }
+            transport.recycled_at = Instant::now();
+            tunnel.transports.push_front(transport);
+            tunnel.transport_available.notify_one();
+            if tunnel.transports.len() > DEFAULT_DATA_TRANSPORTS && !tunnel.idle_trim_scheduled {
+                tunnel.idle_trim_scheduled = true;
+                schedule_trim = Some(tunnel.generation);
+            }
         }
-        tunnel.transports.push_back(transport);
-        tunnel.transport_available.notify_waiters();
+        if let Some(generation) = schedule_trim {
+            let registry = self.clone();
+            let tunnel_id = tunnel_id.clone();
+            tokio::spawn(async move {
+                trim_excess_idle_transports(registry, tunnel_id, generation).await;
+            });
+        }
     }
 
     /// Closes every session and refuses new ones.
     pub fn shutdown(&self) {
         let mut state = self.state();
         state.shutdown = true;
+        for tunnel in state.tunnels.values() {
+            tunnel.demand_notify.notify_waiters();
+        }
         state.tunnels.clear();
         drop(state);
         self.shutdown.send_replace(true);
@@ -271,8 +345,104 @@ impl Registry {
             return;
         };
         tunnel.sessions.retain(|(id, _)| *id != session_id);
-        if tunnel.sessions.is_empty() {
-            state.tunnels.remove(tunnel_id);
+        if tunnel.sessions.is_empty()
+            && let Some(removed) = state.tunnels.remove(tunnel_id)
+        {
+            removed.demand_notify.notify_waiters();
+        }
+    }
+}
+
+/// Sends coalesced burst demand hints (`waiting_visitors`) to the node over a
+/// single lazily-opened `tnl/demand` control stream so the node can open all
+/// needed data transports in one parallel wave rather than slow serial waves.
+async fn run_demand_notifier(
+    registry: Registry,
+    tunnel_id: TunnelId,
+    generation: u64,
+    demand_notify: Arc<Notify>,
+) {
+    let mut stream: Option<Stream> = None;
+    loop {
+        demand_notify.notified().await;
+        // Let simultaneous visitor arrivals coalesce into one demand hint.
+        tokio::task::yield_now().await;
+
+        let waiting = {
+            let state = registry.state();
+            if state.shutdown {
+                return;
+            }
+            let Some(tunnel) = state.tunnels.get(&tunnel_id) else {
+                return;
+            };
+            if tunnel.generation != generation {
+                return;
+            }
+            tunnel.waiting_visitors
+        };
+
+        if waiting == 0 {
+            continue;
+        }
+
+        if stream.is_none() {
+            match registry.open(&tunnel_id, DEMAND_TAG).await {
+                Some(Ok(opened)) => stream = Some(opened),
+                Some(Err(_)) | None => return,
+            }
+        }
+
+        let count = u16::try_from(waiting).unwrap_or(u16::MAX);
+        if let Some(s) = stream.as_mut()
+            && (s.write_all(&count.to_be_bytes()).await.is_err() || s.flush().await.is_err())
+        {
+            stream = None;
+        }
+    }
+}
+
+/// Periodically drops excess idle transports at the cold back of the LIFO pool
+/// once they have gone unused for [`IDLE_SHRINK_AGE`], shrinking post-burst
+/// pools back to [`DEFAULT_DATA_TRANSPORTS`].
+async fn trim_excess_idle_transports(registry: Registry, tunnel_id: TunnelId, generation: u64) {
+    loop {
+        tokio::time::sleep(IDLE_SHRINK_AGE).await;
+        let mut to_drop = Vec::new();
+        let continue_trimming = {
+            let mut state = registry.state();
+            if state.shutdown {
+                return;
+            }
+            let Some(tunnel) = state.tunnels.get_mut(&tunnel_id) else {
+                return;
+            };
+            if tunnel.generation != generation {
+                return;
+            }
+            let now = Instant::now();
+            while tunnel.transports.len() > DEFAULT_DATA_TRANSPORTS {
+                let is_cold = tunnel
+                    .transports
+                    .back()
+                    .is_some_and(|t| now.duration_since(t.recycled_at) >= IDLE_SHRINK_AGE);
+                if !is_cold {
+                    break;
+                }
+                if let Some(transport) = tunnel.transports.pop_back() {
+                    to_drop.push(transport);
+                }
+            }
+            if tunnel.transports.len() <= DEFAULT_DATA_TRANSPORTS {
+                tunnel.idle_trim_scheduled = false;
+                false
+            } else {
+                true
+            }
+        };
+        drop(to_drop);
+        if !continue_trimming {
+            return;
         }
     }
 }
@@ -510,5 +680,33 @@ mod tests {
             add(&registry, &tunnel_id, generation, stream),
             Err(AddTransportError::NotRegistered)
         );
+    }
+
+    #[tokio::test]
+    async fn shrinks_excess_idle_transports_on_recycle() {
+        use tnl_core::protocol::MAX_IDLE_RETAINED_TRANSPORTS;
+
+        let registry = registry();
+        let tunnel_id = TunnelId::new("transport-shrink").unwrap();
+        let _registration = register(&registry, &tunnel_id, "owner-a").await.unwrap();
+        let generation = registry.transport_grant(&tunnel_id).unwrap().generation;
+
+        let mut sessions = Vec::new();
+        let mut taken = Vec::new();
+        for _ in 0..(MAX_IDLE_RETAINED_TRANSPORTS + 4) {
+            let (stream, client, server) = sideband().await;
+            sessions.push((client, server));
+            add(&registry, &tunnel_id, generation, stream).unwrap();
+            taken.push(registry.take_transport(&tunnel_id).unwrap());
+        }
+        for transport in taken {
+            registry.recycle_transport(&tunnel_id, transport);
+        }
+
+        let mut retained = 0;
+        while registry.take_transport(&tunnel_id).is_some() {
+            retained += 1;
+        }
+        assert_eq!(retained, MAX_IDLE_RETAINED_TRANSPORTS);
     }
 }

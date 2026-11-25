@@ -7,7 +7,7 @@ version = "0.1.0"
 
 [profile.release]
 codegen-units = 1
-lto = "thin"
+lto = "fat"
 
 # Upstream re-notifies pending ACME challenges, which Boulder rejects with 409.
 # Keep this patch until rustls-acme includes the fix.

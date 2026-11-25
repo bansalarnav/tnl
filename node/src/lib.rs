@@ -20,6 +20,7 @@
 mod certificate;
 mod client;
 mod forward;
+mod tls_relay;
 mod tunnel;
 
 use std::{
