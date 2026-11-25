@@ -36,7 +36,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
-use tnl_core::{SessionConfig, TunnelId, net};
+use tnl_core::{SessionConfig, TunnelId, net, quic};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
@@ -157,6 +157,24 @@ impl Relay {
     pub async fn serve(&self, listener: TcpListener) -> io::Result<()> {
         let (inherited_nodelay, inherited_keepalive) = net::configure_tcp_listener(&listener);
         let mut connections = JoinSet::new();
+
+        // Bind a QUIC/UDP endpoint on the same address/port as the TCP listener
+        // so nodes can establish multiplexed QUIC data connections when UDP is
+        // available. Failures are non-fatal: nodes seamlessly use TCP transports.
+        if let Ok(local_addr) = listener.local_addr() {
+            match self.bind_quic_endpoint(local_addr) {
+                Ok(endpoint) => {
+                    let relay = self.clone();
+                    connections.spawn(async move {
+                        relay.accept_quic_loop(endpoint).await;
+                    });
+                }
+                Err(error) => {
+                    warn!(%local_addr, "could not start QUIC UDP listener: {error:#}");
+                }
+            }
+        }
+
         loop {
             let (stream, peer) = listener.accept().await?;
             if !inherited_nodelay
@@ -249,5 +267,69 @@ impl Relay {
 
     fn next_transport_id(&self) -> u64 {
         self.inner.next_transport_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn bind_quic_endpoint(&self, addr: std::net::SocketAddr) -> Result<quinn::Endpoint> {
+        let mut tls = (*self.inner.api_tls).clone();
+        tls.alpn_protocols = vec![quic::QUIC_ALPN.to_vec()];
+        tls.ignore_client_order = true;
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
+            .context("could not build QUIC server TLS config")?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        server_config.transport_config(quic::transport_config());
+        let udp_socket = quic::bind_udp_socket(addr).context("could not bind QUIC UDP socket")?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            udp_socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .context("could not create QUIC endpoint")?;
+        Ok(endpoint)
+    }
+
+    async fn accept_quic_loop(self, endpoint: quinn::Endpoint) {
+        let mut tasks = JoinSet::new();
+        while let Some(incoming) = endpoint.accept().await {
+            while tasks.try_join_next().is_some() {}
+            let relay = self.clone();
+            tasks.spawn(async move {
+                if let Err(error) = relay.handle_quic_connection(incoming).await
+                    && !net::is_routine_disconnect(error.as_ref())
+                {
+                    debug!("QUIC data connection ended: {error:#}");
+                }
+            });
+        }
+    }
+
+    async fn handle_quic_connection(&self, incoming: quinn::Incoming) -> Result<()> {
+        let conn = timeout(DATA_TRANSPORT_TIMEOUT, incoming)
+            .await
+            .context("timed out completing QUIC handshake")?
+            .context("QUIC handshake failed")?;
+
+        let registry = &self.inner.registry;
+        let mut grant_generation = None;
+        let tunnel_id = timeout(
+            DATA_TRANSPORT_TIMEOUT,
+            quic::authenticate_server(&conn, |tunnel_id| {
+                let grant = registry.transport_grant(tunnel_id)?;
+                grant_generation = Some(grant.generation);
+                Some(grant.key)
+            }),
+        )
+        .await
+        .context("timed out authenticating QUIC data connection")?
+        .context("QUIC data connection authentication failed")?;
+
+        let generation = grant_generation.context("tunnel grant missing")?;
+        let conn_id = self.next_transport_id();
+        registry.add_quic_connection(&tunnel_id, generation, conn_id, conn.clone())?;
+        debug!(%tunnel_id, conn_id, "QUIC data connection registered");
+        let _ = conn.closed().await;
+        registry.remove_quic_connection(&tunnel_id, generation, conn_id);
+        debug!(%tunnel_id, conn_id, "QUIC data connection closed");
+        Ok(())
     }
 }

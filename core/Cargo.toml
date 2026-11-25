@@ -8,6 +8,7 @@ description = "Wire protocol and multiplexed sessions shared by tnl relays and n
 async-trait = "0.1.89"
 hmac = "0.12.1"
 muxado = "0.5.4"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23.42", default-features = false, features = ["std"] }
 sha2 = "0.10.9"
 socket2 = { version = "0.6.5", features = ["all"] }

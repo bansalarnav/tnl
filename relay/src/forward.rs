@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use tnl_core::{SidebandStream, TunnelId, protocol::FORWARD_TAG};
+use tnl_core::{SidebandStream, TunnelId, protocol::FORWARD_TAG, quic::QuicStream};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     time::timeout,
@@ -72,6 +72,19 @@ pub(crate) async fn forward<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    if let Some(quic) = registry.pick_quic_connection(tunnel_id)
+        && let Ok((mut send, recv)) = quic.open_bi().await
+    {
+        send.write_all(prefixed_hello.client_hello())
+            .await
+            .context("could not forward the visitor's TLS ClientHello over QUIC")?;
+        let mut node = QuicStream::new(send, recv);
+        copy_bidirectional_pooled(visitor, &mut node)
+            .await
+            .context("QUIC tunnel forwarding failed")?;
+        return Ok(());
+    }
+
     let transport = if registry.prefers_transports(tunnel_id) {
         registry
             .take_transport_within(tunnel_id, TRANSPORT_WAIT)

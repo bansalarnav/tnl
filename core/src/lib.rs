@@ -12,6 +12,7 @@ pub mod data_transport;
 mod id;
 pub mod net;
 pub mod protocol;
+pub mod quic;
 mod session;
 mod sideband;
 

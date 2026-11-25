@@ -15,6 +15,7 @@ use tnl_core::{
         DEFAULT_DATA_TRANSPORTS, DEMAND_TAG, MAX_CONTROL_SESSIONS, MAX_DATA_TRANSPORTS,
         MAX_IDLE_RETAINED_TRANSPORTS,
     },
+    quic::MAX_QUIC_CONNECTIONS,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -70,6 +71,8 @@ struct Tunnel {
     generation: u64,
     sessions: Vec<(u64, Opener)>,
     next_session: usize,
+    quic_connections: Vec<(u64, quinn::Connection)>,
+    next_quic: usize,
     transports: VecDeque<DataTransport>,
     transport_available: Arc<Notify>,
     /// Number of visitors currently blocked waiting for a data transport.
@@ -124,6 +127,8 @@ impl Registry {
                 generation: session_id,
                 sessions: Vec::new(),
                 next_session: 0,
+                quic_connections: Vec::new(),
+                next_quic: 0,
                 transports: VecDeque::new(),
                 transport_available: Arc::new(Notify::new()),
                 waiting_visitors: 0,
@@ -179,6 +184,65 @@ impl Registry {
                 key: tunnel.transport_key.clone(),
                 generation: tunnel.generation,
             })
+    }
+
+    /// Registers an authenticated QUIC data connection for `tunnel_id`.
+    pub fn add_quic_connection(
+        &self,
+        tunnel_id: &TunnelId,
+        generation: u64,
+        conn_id: u64,
+        connection: quinn::Connection,
+    ) -> Result<(), AddTransportError> {
+        let mut state = self.state();
+        if state.shutdown {
+            return Err(AddTransportError::Shutdown);
+        }
+        let tunnel = state
+            .tunnels
+            .get_mut(tunnel_id)
+            .filter(|tunnel| tunnel.generation == generation)
+            .ok_or(AddTransportError::NotRegistered)?;
+        tunnel
+            .quic_connections
+            .retain(|(_, existing)| existing.close_reason().is_none());
+        if tunnel.quic_connections.len() >= MAX_QUIC_CONNECTIONS {
+            return Err(AddTransportError::PoolFull);
+        }
+        tunnel.quic_connections.push((conn_id, connection));
+        Ok(())
+    }
+
+    /// Removes a closed QUIC data connection from `tunnel_id`.
+    pub fn remove_quic_connection(&self, tunnel_id: &TunnelId, generation: u64, conn_id: u64) {
+        let mut state = self.state();
+        if let Some(tunnel) = state
+            .tunnels
+            .get_mut(tunnel_id)
+            .filter(|tunnel| tunnel.generation == generation)
+        {
+            tunnel.quic_connections.retain(|(id, _)| *id != conn_id);
+        }
+    }
+
+    /// Picks a live QUIC data connection for `tunnel_id`, round-robin.
+    pub fn pick_quic_connection(&self, tunnel_id: &TunnelId) -> Option<quinn::Connection> {
+        let mut state = self.state();
+        let tunnel = state.tunnels.get_mut(tunnel_id)?;
+        let len = tunnel.quic_connections.len();
+        if len == 0 {
+            return None;
+        }
+        for _ in 0..len {
+            let index = tunnel.next_quic % len;
+            tunnel.next_quic = tunnel.next_quic.wrapping_add(1);
+            let (_, conn) = &tunnel.quic_connections[index];
+            if conn.close_reason().is_none() {
+                return Some(conn.clone());
+            }
+        }
+        tunnel.quic_connections.clear();
+        None
     }
 
     /// Adds an authenticated data transport to the tunnel registration that
@@ -320,6 +384,9 @@ impl Registry {
         state.shutdown = true;
         for tunnel in state.tunnels.values() {
             tunnel.demand_notify.notify_waiters();
+            for (_, conn) in &tunnel.quic_connections {
+                conn.close(0_u32.into(), b"relay shutting down");
+            }
         }
         state.tunnels.clear();
         drop(state);
@@ -349,6 +416,9 @@ impl Registry {
             && let Some(removed) = state.tunnels.remove(tunnel_id)
         {
             removed.demand_notify.notify_waiters();
+            for (_, conn) in &removed.quic_connections {
+                conn.close(0_u32.into(), b"tunnel unregistered");
+            }
         }
     }
 }

@@ -17,15 +17,16 @@ use rand::Rng;
 use tnl_core::{
     Session, SessionConfig, SidebandStream, Stream, TunnelId, data_transport, net,
     protocol::{ACTIVATION_MARKER, DEMAND_TAG, FORWARD_TAG, MAX_DATA_TRANSPORTS, parse_sideband_tag},
+    quic::{self, QuicStream},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
     sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot},
     task::JoinSet,
-    time::Instant,
+    time::{Instant, timeout},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{
@@ -185,14 +186,55 @@ impl Tunnel {
                 Arc::clone(&pool),
             ));
         }
-        let mut supervisor = JoinSet::new();
-        supervisor.spawn(supervise_data_transports(
-            Arc::clone(&self.client),
-            self.id.clone(),
-            Arc::clone(&pool),
-            Arc::clone(handler),
-            Arc::clone(&sidebands),
-        ));
+
+        let mut transport_tasks = JoinSet::new();
+        let quic_target = quic::configured_connections();
+        let first_quic = if quic_target > 0 {
+            match timeout(Duration::from_secs(2), self.client.connect_quic(&self.id)).await {
+                Ok(Ok(pair)) => Some(pair),
+                Ok(Err(error)) => {
+                    debug!(
+                        tunnel_id = %self.id,
+                        "QUIC data plane unavailable, falling back to raw TCP transports: {error:#}"
+                    );
+                    None
+                }
+                Err(_) => {
+                    debug!(
+                        tunnel_id = %self.id,
+                        "QUIC data plane timed out, falling back to raw TCP transports"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(initial) = first_quic {
+            transport_tasks.spawn(serve_quic_worker(
+                Arc::clone(&self.client),
+                self.id.clone(),
+                Arc::clone(handler),
+                Some(initial),
+            ));
+            for _ in 1..quic_target {
+                transport_tasks.spawn(serve_quic_worker(
+                    Arc::clone(&self.client),
+                    self.id.clone(),
+                    Arc::clone(handler),
+                    None,
+                ));
+            }
+        } else {
+            transport_tasks.spawn(supervise_data_transports(
+                Arc::clone(&self.client),
+                self.id.clone(),
+                Arc::clone(&pool),
+                Arc::clone(handler),
+                Arc::clone(&sidebands),
+            ));
+        }
 
         session_tasks
             .join_next()
@@ -287,6 +329,51 @@ async fn serve_demand_stream(mut stream: Stream, pool: Arc<ElasticPool>) {
     while stream.read_exact(&mut buf).await.is_ok() {
         let waiting = usize::from(u16::from_be_bytes(buf));
         pool.record_demand(waiting);
+    }
+}
+
+/// Maintains one QUIC/UDP data connection to the relay, dispatching every
+/// incoming bidirectional visitor stream concurrently without HoL blocking.
+async fn serve_quic_worker<H: Handler>(
+    client: Arc<Client>,
+    tunnel_id: TunnelId,
+    handler: Arc<H>,
+    mut initial: Option<(quinn::Endpoint, quinn::Connection)>,
+) {
+    loop {
+        let (endpoint, conn) = match initial.take() {
+            Some(pair) => pair,
+            None => match client.connect_quic(&tunnel_id).await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    log_error("QUIC data transport failed", error.as_ref());
+                    tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
+                    continue;
+                }
+            },
+        };
+
+        let mut visitors = JoinSet::new();
+        loop {
+            match conn.accept_bi().await {
+                Ok((send, recv)) => {
+                    let handler = Arc::clone(&handler);
+                    while visitors.try_join_next().is_some() {}
+                    visitors.spawn(async move {
+                        let mut stream = QuicStream::new(send, recv);
+                        if let Err(error) = handler.handle(Visitor::new(&mut stream)).await {
+                            log_error("QUIC tunnel connection failed", &*error);
+                        }
+                    });
+                }
+                Err(error) => {
+                    debug!(%tunnel_id, "QUIC data connection closed: {error}");
+                    break;
+                }
+            }
+        }
+        drop(endpoint);
+        tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
     }
 }
 

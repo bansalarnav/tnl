@@ -52,6 +52,17 @@ impl TransportKey {
         mac.update(challenge);
         mac
     }
+
+    /// Computes a domain-separated HMAC proof binding a QUIC data connection's
+    /// TLS 1.3 exported keying material to `tunnel_id`.
+    pub(crate) fn quic_proof(&self, tunnel_id: &TunnelId, exporter: &[u8; 32]) -> Hmac<Sha256> {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(self.0.as_bytes()).expect("HMAC accepts any key size");
+        mac.update(b"tnl-quic-auth-v6");
+        mac.update(tunnel_id.as_str().as_bytes());
+        mac.update(exporter);
+        mac
+    }
 }
 
 /// Node side: requests a data transport and answers the relay's challenge.
