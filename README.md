@@ -16,6 +16,8 @@ Server:
 curl -fsSL https://raw.githubusercontent.com/bansalarnav/tnl/main/install.sh | sh -s -- --server
 ```
 
+On Windows x86_64, download `tnl-v<version>-windows-x86_64.zip` from the [latest release](https://github.com/bansalarnav/tnl/releases/latest), extract it, and run `tnlc.exe` from PowerShell. Add the extracted directory to your `PATH` to use it from any directory. Windows releases include the client only; the server setup requires Linux with systemd.
+
 ### Build from source
 
 Rust users can install either package directly from GitHub:
