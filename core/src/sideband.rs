@@ -34,6 +34,13 @@ pub struct SidebandStream<S, C> {
 
 impl<S, C> SidebandStream<S, C> {
     pub fn new(inner: S, sideband: C) -> Self {
+        Self::with_initial_written(inner, sideband, 0)
+    }
+
+    /// Creates a stream accounting for `initial_written` payload bytes that
+    /// were already written to `inner` (for example, coalesced with the
+    /// activation marker in a single write syscall).
+    pub fn with_initial_written(inner: S, sideband: C, initial_written: u64) -> Self {
         Self {
             inner,
             sideband,
@@ -42,12 +49,17 @@ impl<S, C> SidebandStream<S, C> {
             read_count_offset: 0,
             read_limit: None,
             read_finished: false,
-            bytes_written: 0,
+            bytes_written: initial_written,
             write_count: [0; SIDEBAND_COUNT_LENGTH],
             write_count_offset: 0,
             write_count_started: false,
             write_finished: false,
         }
+    }
+
+    /// Returns whether the incoming direction has reached its sideband boundary.
+    pub fn is_read_finished(&self) -> bool {
+        self.read_finished
     }
 
     /// Returns whether both directions have reached their boundary.
@@ -80,6 +92,40 @@ impl<S, C> SidebandStream<S, C> {
         }
         Ok(())
     }
+
+    fn poll_sideband_limit(&mut self, context: &mut Context<'_>) -> Poll<io::Result<u64>>
+    where
+        C: AsyncRead + Unpin,
+    {
+        while self.read_count_offset < SIDEBAND_COUNT_LENGTH {
+            let mut count = ReadBuf::new(
+                &mut self.read_count[self.read_count_offset..SIDEBAND_COUNT_LENGTH],
+            );
+            match Pin::new(&mut self.sideband).poll_read(context, &mut count) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {
+                    let read = count.filled().len();
+                    if read == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "sideband closed before the payload byte count",
+                        )));
+                    }
+                    self.read_count_offset += read;
+                }
+            }
+        }
+        let limit = u64::from_be_bytes(self.read_count);
+        if limit < self.bytes_read {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sideband payload byte count is smaller than data already received",
+            )));
+        }
+        self.read_limit = Some(limit);
+        Poll::Ready(Ok(limit))
+    }
 }
 
 impl<S, C> AsyncRead for SidebandStream<S, C>
@@ -97,49 +143,53 @@ where
             return Poll::Ready(Ok(()));
         }
 
+        // Fast path: when no boundary has been received yet, poll the raw data
+        // socket first. Because the peer cannot reuse the data socket for a
+        // later visitor until `finish()` exchanges ACKs, every byte currently
+        // readable from `inner` is guaranteed to belong to this visitor. This
+        // avoids polling the muxado sideband stream on every hot-path read.
         if this.read_limit.is_none() {
-            while this.read_count_offset < SIDEBAND_COUNT_LENGTH {
-                let mut count = ReadBuf::new(
-                    &mut this.read_count[this.read_count_offset..SIDEBAND_COUNT_LENGTH],
-                );
-                match Pin::new(&mut this.sideband).poll_read(context, &mut count) {
-                    Poll::Pending => break,
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                    Poll::Ready(Ok(())) => {
-                        let read = count.filled().len();
-                        if read == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "sideband closed before the payload byte count",
-                            )));
-                        }
-                        this.read_count_offset += read;
+            let before = buffer.filled().len();
+            match Pin::new(&mut this.inner).poll_read(context, buffer) {
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {
+                    let read = buffer.filled().len() - before;
+                    if read == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "raw data transport closed before its sideband boundary",
+                        )));
                     }
+                    this.bytes_read =
+                        this.bytes_read.checked_add(read as u64).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "payload byte count overflow")
+                        })?;
+                    return Poll::Ready(Ok(()));
                 }
-            }
-            if this.read_count_offset == SIDEBAND_COUNT_LENGTH {
-                let limit = u64::from_be_bytes(this.read_count);
-                if limit < this.bytes_read {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "sideband payload byte count is smaller than data already received",
-                    )));
-                }
-                this.read_limit = Some(limit);
+                Poll::Pending => match this.poll_sideband_limit(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(limit)) => {
+                        if limit == this.bytes_read {
+                            this.read_finished = true;
+                            return Poll::Ready(Ok(()));
+                        }
+                        // Fall through to re-poll `inner` once with the now-known
+                        // limit in case final bytes arrived right after `Pending`.
+                    }
+                },
             }
         }
 
-        if this.read_limit == Some(this.bytes_read) {
+        let limit = this.read_limit.expect("read_limit is set");
+        if limit == this.bytes_read {
             this.read_finished = true;
             return Poll::Ready(Ok(()));
         }
 
-        let capacity = match this.read_limit {
-            Some(limit) => buffer
-                .remaining()
-                .min(usize::try_from(limit - this.bytes_read).unwrap_or(usize::MAX)),
-            None => buffer.remaining(),
-        };
+        let capacity = buffer
+            .remaining()
+            .min(usize::try_from(limit - this.bytes_read).unwrap_or(usize::MAX));
         let destination = &mut buffer.initialize_unfilled()[..capacity];
         let mut limited = ReadBuf::new(destination);
         match Pin::new(&mut this.inner).poll_read(context, &mut limited) {
@@ -157,6 +207,9 @@ where
                     io::Error::new(io::ErrorKind::InvalidData, "payload byte count overflow")
                 })?;
                 buffer.advance(read);
+                if this.bytes_read == limit {
+                    this.read_finished = true;
+                }
                 Poll::Ready(Ok(()))
             }
         }
@@ -195,6 +248,39 @@ where
             }
             result => result,
         }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.write_count_started {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "sideband transport stream is finished",
+            )));
+        }
+        match Pin::new(&mut this.inner).poll_write_vectored(context, buffers) {
+            Poll::Ready(Ok(written)) => {
+                this.bytes_written =
+                    this.bytes_written
+                        .checked_add(written as u64)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "payload byte count overflow",
+                            )
+                        })?;
+                Poll::Ready(Ok(written))
+            }
+            result => result,
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -272,6 +358,42 @@ mod tests {
                 assert_eq!(received, expected);
                 stream.finish().await.unwrap();
             }
+        });
+
+        left_task.await.unwrap();
+        right_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accounts_for_initial_written_bytes_and_handles_delayed_boundary() {
+        let (mut left_data, mut right_data) = tokio::io::duplex(4096);
+        let (mut left_control, mut right_control) = tokio::io::duplex(128);
+
+        let left_task = tokio::spawn(async move {
+            let prefix = b"client-hello";
+            left_data.write_all(prefix).await.unwrap();
+            let mut stream = SidebandStream::with_initial_written(
+                &mut left_data,
+                &mut left_control,
+                prefix.len() as u64,
+            );
+            stream.write_all(b"-and-payload").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            assert_eq!(buf, b"reply");
+            assert!(stream.is_read_finished());
+            stream.finish().await.unwrap();
+        });
+
+        let right_task = tokio::spawn(async move {
+            let mut stream = SidebandStream::new(&mut right_data, &mut right_control);
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            assert_eq!(buf, b"client-hello-and-payload");
+            stream.write_all(b"reply").await.unwrap();
+            stream.shutdown().await.unwrap();
+            stream.finish().await.unwrap();
         });
 
         left_task.await.unwrap();

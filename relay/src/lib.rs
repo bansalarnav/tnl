@@ -36,9 +36,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
-use tnl_core::{SessionConfig, TunnelId, data_transport, net};
+use tnl_core::{SessionConfig, TunnelId, net, quic};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
     task::JoinSet,
     time::timeout,
@@ -155,11 +155,37 @@ impl Relay {
     /// Accepts and handles connections until accepting fails. Dropping the
     /// returned future drops every connection it accepted.
     pub async fn serve(&self, listener: TcpListener) -> io::Result<()> {
+        let (inherited_nodelay, inherited_keepalive) = net::configure_tcp_listener(&listener);
         let mut connections = JoinSet::new();
+
+        // Bind a QUIC/UDP endpoint on the same address/port as the TCP listener
+        // so nodes can establish multiplexed QUIC data connections when UDP is
+        // available. Failures are non-fatal: nodes seamlessly use TCP transports.
+        if let Ok(local_addr) = listener.local_addr() {
+            match self.bind_quic_endpoint(local_addr) {
+                Ok(endpoint) => {
+                    let relay = self.clone();
+                    connections.spawn(async move {
+                        relay.accept_quic_loop(endpoint).await;
+                    });
+                }
+                Err(error) => {
+                    warn!(%local_addr, "could not start QUIC UDP listener: {error:#}");
+                }
+            }
+        }
+
         loop {
             let (stream, peer) = listener.accept().await?;
-            if let Err(error) = net::configure_tcp_stream(&stream) {
-                warn!(%peer, "could not configure TCP socket: {error}");
+            if !inherited_nodelay
+                && let Err(error) = stream.set_nodelay(true)
+            {
+                warn!(%peer, "could not disable Nagle's algorithm: {error}");
+            }
+            if !inherited_keepalive
+                && let Err(error) = net::configure_tcp_keepalive(&stream)
+            {
+                warn!(%peer, "could not configure TCP keepalive: {error}");
             }
             while connections.try_join_next().is_some() {}
             connections.spawn(
@@ -188,59 +214,51 @@ impl Relay {
         self.inner.registry.shutdown();
     }
 
-    async fn route<S>(&self, mut stream: S) -> Result<()>
+    async fn route<S>(&self, stream: S) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let first_byte = stream
-            .read_u8()
-            .await
-            .context("could not read the connection preface")?;
-        if first_byte == data_transport::PREFACE_BYTE {
-            return timeout(
+        match tls::inspect_connection(stream, &self.inner.domain).await? {
+            None => Ok(()),
+            Some(tls::InspectedConnection::DataTransport { prefix, stream }) => timeout(
                 DATA_TRANSPORT_TIMEOUT,
-                data::accept(self, stream, first_byte),
+                data::accept(self, stream, prefix.as_slice()),
             )
             .await
-            .context("timed out adding a data transport")?;
-        }
-        if first_byte != tls::HANDSHAKE_RECORD {
-            stream.shutdown().await?;
-            return Ok(());
-        }
-
-        let hello = tls::read_client_hello(stream, first_byte).await?;
-        let Some(server_name) = hello.server_name() else {
-            return Ok(());
-        };
-
-        if server_name == self.inner.domain {
-            if hello.is_acme_challenge()
-                && let Some(config) = &self.inner.acme_challenge_tls
-            {
-                let mut stream = hello.terminate(Arc::clone(config)).await?;
-                stream.shutdown().await?;
-                return Ok(());
+            .context("timed out adding a data transport")?,
+            Some(tls::InspectedConnection::Api(hello)) => {
+                if hello.is_acme_challenge()
+                    && let Some(config) = &self.inner.acme_challenge_tls
+                {
+                    let mut stream = hello.terminate(Arc::clone(config)).await?;
+                    stream.shutdown().await?;
+                    return Ok(());
+                }
+                let stream = hello.terminate(Arc::clone(&self.inner.api_tls)).await?;
+                api::serve(self.clone(), stream).await
             }
-            let stream = hello.terminate(Arc::clone(&self.inner.api_tls)).await?;
-            return api::serve(self.clone(), stream).await;
+            Some(tls::InspectedConnection::Tunnel(hello)) => {
+                let Some(tunnel_id) = hello
+                    .server_name()
+                    .strip_suffix(&self.inner.tunnel_suffix)
+                    .and_then(|name| TunnelId::new(name).ok())
+                else {
+                    debug!(
+                        server_name = hello.server_name(),
+                        "no tunnel for server name"
+                    );
+                    return Ok(());
+                };
+                let (prefixed_hello, mut visitor) = hello.into_parts();
+                forward::forward(
+                    &self.inner.registry,
+                    &tunnel_id,
+                    &prefixed_hello,
+                    &mut visitor,
+                )
+                .await
+            }
         }
-
-        let Some(tunnel_id) = server_name
-            .strip_suffix(&self.inner.tunnel_suffix)
-            .and_then(|name| TunnelId::new(name).ok())
-        else {
-            debug!(server_name, "no tunnel for server name");
-            return Ok(());
-        };
-        let (client_hello, mut visitor) = hello.into_parts();
-        forward::forward(
-            &self.inner.registry,
-            &tunnel_id,
-            &client_hello,
-            &mut visitor,
-        )
-        .await
     }
 
     fn tunnel_url(&self, tunnel_id: &TunnelId) -> String {
@@ -249,5 +267,69 @@ impl Relay {
 
     fn next_transport_id(&self) -> u64 {
         self.inner.next_transport_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn bind_quic_endpoint(&self, addr: std::net::SocketAddr) -> Result<quinn::Endpoint> {
+        let mut tls = (*self.inner.api_tls).clone();
+        tls.alpn_protocols = vec![quic::QUIC_ALPN.to_vec()];
+        tls.ignore_client_order = true;
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
+            .context("could not build QUIC server TLS config")?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        server_config.transport_config(quic::transport_config());
+        let udp_socket = quic::bind_udp_socket(addr).context("could not bind QUIC UDP socket")?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            udp_socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .context("could not create QUIC endpoint")?;
+        Ok(endpoint)
+    }
+
+    async fn accept_quic_loop(self, endpoint: quinn::Endpoint) {
+        let mut tasks = JoinSet::new();
+        while let Some(incoming) = endpoint.accept().await {
+            while tasks.try_join_next().is_some() {}
+            let relay = self.clone();
+            tasks.spawn(async move {
+                if let Err(error) = relay.handle_quic_connection(incoming).await
+                    && !net::is_routine_disconnect(error.as_ref())
+                {
+                    debug!("QUIC data connection ended: {error:#}");
+                }
+            });
+        }
+    }
+
+    async fn handle_quic_connection(&self, incoming: quinn::Incoming) -> Result<()> {
+        let conn = timeout(DATA_TRANSPORT_TIMEOUT, incoming)
+            .await
+            .context("timed out completing QUIC handshake")?
+            .context("QUIC handshake failed")?;
+
+        let registry = &self.inner.registry;
+        let mut grant_generation = None;
+        let tunnel_id = timeout(
+            DATA_TRANSPORT_TIMEOUT,
+            quic::authenticate_server(&conn, |tunnel_id| {
+                let grant = registry.transport_grant(tunnel_id)?;
+                grant_generation = Some(grant.generation);
+                Some(grant.key)
+            }),
+        )
+        .await
+        .context("timed out authenticating QUIC data connection")?
+        .context("QUIC data connection authentication failed")?;
+
+        let generation = grant_generation.context("tunnel grant missing")?;
+        let conn_id = self.next_transport_id();
+        registry.add_quic_connection(&tunnel_id, generation, conn_id, conn.clone())?;
+        debug!(%tunnel_id, conn_id, "QUIC data connection registered");
+        let _ = conn.closed().await;
+        registry.remove_quic_connection(&tunnel_id, generation, conn_id);
+        debug!(%tunnel_id, conn_id, "QUIC data connection closed");
+        Ok(())
     }
 }

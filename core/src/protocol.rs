@@ -20,11 +20,26 @@ pub const TRANSPORT_POOL_HEADER: &str = "X-Tnl-Transport-Pool";
 /// Most control sessions one tunnel may hold.
 pub const MAX_CONTROL_SESSIONS: usize = 8;
 
-/// Most idle data transports a relay keeps for one tunnel.
-pub const MAX_DATA_TRANSPORTS: usize = 64;
+/// Default number of control sessions a relay asks each node to open.
+pub const DEFAULT_CONTROL_SESSIONS: usize = 2;
+
+/// Default number of warm idle data transports a relay asks each node to keep.
+pub const DEFAULT_DATA_TRANSPORTS: usize = 8;
+
+/// Most idle data transports a relay retains immediately when recycling after a
+/// burst (cold excess transports above [`DEFAULT_DATA_TRANSPORTS`] are trimmed
+/// after an idle grace period).
+pub const MAX_IDLE_RETAINED_TRANSPORTS: usize = 16;
+
+/// Most data transports a relay accepts for one tunnel during bursts.
+pub const MAX_DATA_TRANSPORTS: usize = 256;
 
 /// Tag of a stream carrying one visitor connection.
 pub const FORWARD_TAG: &str = "tnl/tcp";
+
+/// Tag of a control stream carrying burst data-transport demand hints from
+/// relay to node (`u16` big-endian count of waiting visitors).
+pub const DEMAND_TAG: &str = "tnl/demand";
 
 const SIDEBAND_TAG_PREFIX: &str = "tnl/sideband/";
 

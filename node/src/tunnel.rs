@@ -2,24 +2,31 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    io,
+    pin::Pin,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
     time::Duration,
 };
 
-use anyhow::{Context, Error, Result, bail};
+use anyhow::{Context as _, Error, Result, bail};
 use rand::Rng;
 use tnl_core::{
     Session, SessionConfig, SidebandStream, Stream, TunnelId, data_transport, net,
-    protocol::{ACTIVATION_MARKER, FORWARD_TAG, parse_sideband_tag},
+    protocol::{ACTIVATION_MARKER, DEMAND_TAG, FORWARD_TAG, MAX_DATA_TRANSPORTS, parse_sideband_tag},
+    quic::{self, QuicStream},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
-    sync::oneshot,
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot},
     task::JoinSet,
-    time::Instant,
+    time::{Instant, timeout},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{
@@ -33,6 +40,7 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(60);
 const RECONNECT_JITTER_MAX: Duration = Duration::from_millis(250);
 const TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const INITIAL_READ_BUF_SIZE: usize = 2048;
 
 /// A tunnel registered with a relay.
 pub struct Tunnel {
@@ -154,7 +162,7 @@ impl Tunnel {
         handler: &Arc<H>,
     ) -> Result<std::convert::Infallible> {
         let control_sessions = first.control_sessions;
-        let transport_pool = first.transport_pool;
+        let target_idle = first.transport_pool;
         let mut sessions = vec![Session::client(first.stream, self.session).await?];
         for _ in 1..control_sessions {
             let registration = self
@@ -167,6 +175,7 @@ impl Tunnel {
         }
 
         let sidebands = Arc::new(Sidebands::default());
+        let pool = Arc::new(ElasticPool::new(target_idle));
         // Dropping these sets aborts the remaining sessions and workers.
         let mut session_tasks = JoinSet::new();
         for session in sessions {
@@ -174,13 +183,54 @@ impl Tunnel {
                 session,
                 Arc::clone(handler),
                 Arc::clone(&sidebands),
+                Arc::clone(&pool),
             ));
         }
+
         let mut transport_tasks = JoinSet::new();
-        for _ in 0..transport_pool {
-            transport_tasks.spawn(serve_transports(
+        let quic_target = quic::configured_connections();
+        let first_quic = if quic_target > 0 {
+            match timeout(Duration::from_secs(2), self.client.connect_quic(&self.id)).await {
+                Ok(Ok(pair)) => Some(pair),
+                Ok(Err(error)) => {
+                    debug!(
+                        tunnel_id = %self.id,
+                        "QUIC data plane unavailable, falling back to raw TCP transports: {error:#}"
+                    );
+                    None
+                }
+                Err(_) => {
+                    debug!(
+                        tunnel_id = %self.id,
+                        "QUIC data plane timed out, falling back to raw TCP transports"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(initial) = first_quic {
+            transport_tasks.spawn(serve_quic_worker(
                 Arc::clone(&self.client),
                 self.id.clone(),
+                Arc::clone(handler),
+                Some(initial),
+            ));
+            for _ in 1..quic_target {
+                transport_tasks.spawn(serve_quic_worker(
+                    Arc::clone(&self.client),
+                    self.id.clone(),
+                    Arc::clone(handler),
+                    None,
+                ));
+            }
+        } else {
+            transport_tasks.spawn(supervise_data_transports(
+                Arc::clone(&self.client),
+                self.id.clone(),
+                Arc::clone(&pool),
                 Arc::clone(handler),
                 Arc::clone(&sidebands),
             ));
@@ -240,6 +290,7 @@ async fn serve_session<H: Handler>(
     mut session: Session,
     handler: Arc<H>,
     sidebands: Arc<Sidebands>,
+    pool: Arc<ElasticPool>,
 ) -> Result<std::convert::Infallible> {
     let mut visitors = JoinSet::new();
     loop {
@@ -249,6 +300,14 @@ async fn serve_session<H: Handler>(
             if !sidebands.deliver(transport_id, stream) {
                 bail!("relay sent a sideband for unknown data transport {transport_id}");
             }
+            continue;
+        }
+        if stream.tag() == DEMAND_TAG {
+            let pool = Arc::clone(&pool);
+            while visitors.try_join_next().is_some() {}
+            visitors.spawn(async move {
+                serve_demand_stream(stream, pool).await;
+            });
             continue;
         }
         if stream.tag() != FORWARD_TAG {
@@ -265,61 +324,372 @@ async fn serve_session<H: Handler>(
     }
 }
 
-/// Keeps one data transport open, replacing it whenever it fails.
-async fn serve_transports<H: Handler>(
+async fn serve_demand_stream(mut stream: Stream, pool: Arc<ElasticPool>) {
+    let mut buf = [0_u8; 2];
+    while stream.read_exact(&mut buf).await.is_ok() {
+        let waiting = usize::from(u16::from_be_bytes(buf));
+        pool.record_demand(waiting);
+    }
+}
+
+/// Maintains one QUIC/UDP data connection to the relay, dispatching every
+/// incoming bidirectional visitor stream concurrently without HoL blocking.
+async fn serve_quic_worker<H: Handler>(
     client: Arc<Client>,
     tunnel_id: TunnelId,
     handler: Arc<H>,
-    sidebands: Arc<Sidebands>,
+    mut initial: Option<(quinn::Endpoint, quinn::Connection)>,
 ) {
     loop {
-        if let Err(error) = serve_transport(&client, &tunnel_id, &*handler, &sidebands).await {
-            log_error("data transport failed", error.as_ref());
+        let (endpoint, conn) = match initial.take() {
+            Some(pair) => pair,
+            None => match client.connect_quic(&tunnel_id).await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    log_error("QUIC data transport failed", error.as_ref());
+                    tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
+                    continue;
+                }
+            },
+        };
+
+        let mut visitors = JoinSet::new();
+        loop {
+            match conn.accept_bi().await {
+                Ok((send, recv)) => {
+                    let handler = Arc::clone(&handler);
+                    while visitors.try_join_next().is_some() {}
+                    visitors.spawn(async move {
+                        let mut stream = QuicStream::new(send, recv);
+                        if let Err(error) = handler.handle(Visitor::new(&mut stream)).await {
+                            log_error("QUIC tunnel connection failed", &*error);
+                        }
+                    });
+                }
+                Err(error) => {
+                    debug!(%tunnel_id, "QUIC data connection closed: {error}");
+                    break;
+                }
+            }
         }
+        drop(endpoint);
         tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
     }
 }
 
-async fn serve_transport<H: Handler>(
+struct ElasticPool {
+    target_idle: usize,
+    idle_count: AtomicUsize,
+    opening_count: AtomicUsize,
+    /// Relay-reported number of visitors currently blocked waiting for a
+    /// data transport, enabling single-wave elastic expansion over WAN links.
+    demand_count: AtomicUsize,
+    replenish: Notify,
+}
+
+impl ElasticPool {
+    fn new(target_idle: usize) -> Self {
+        Self {
+            target_idle: target_idle.max(1),
+            idle_count: AtomicUsize::new(0),
+            opening_count: AtomicUsize::new(0),
+            demand_count: AtomicUsize::new(0),
+            replenish: Notify::new(),
+        }
+    }
+
+    fn record_demand(&self, waiting: usize) {
+        self.demand_count.fetch_max(waiting, Ordering::AcqRel);
+        if self.deficit() > 0 {
+            self.replenish.notify_one();
+        }
+    }
+
+    #[inline]
+    fn deficit(&self) -> usize {
+        let idle = self.idle_count.load(Ordering::Acquire);
+        let opening = self.opening_count.load(Ordering::Acquire);
+        let demand = self.demand_count.load(Ordering::Acquire);
+        let desired = if demand > 0 {
+            // Open enough transports in one parallel wave to satisfy all
+            // waiting visitors plus the warm idle floor.
+            demand.saturating_add(self.target_idle).min(MAX_DATA_TRANSPORTS)
+        } else {
+            self.target_idle
+        };
+        desired.saturating_sub(idle + opening)
+    }
+
+    #[inline]
+    fn maybe_notify_replenish(&self) {
+        if self.deficit() > 0 {
+            self.replenish.notify_one();
+        }
+    }
+}
+
+struct ReplenishOnDrop(Arc<ElasticPool>);
+
+impl Drop for ReplenishOnDrop {
+    fn drop(&mut self) {
+        self.0.maybe_notify_replenish();
+    }
+}
+
+struct CounterGuard<'a>(&'a AtomicUsize);
+
+impl<'a> CounterGuard<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for CounterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Maintains a lean warm idle pool (`target_idle`) of reusable data transports
+/// that expands elastically up to `MAX_DATA_TRANSPORTS` during bursts and
+/// shrinks automatically when the relay closes excess idle transports.
+async fn supervise_data_transports<H: Handler>(
+    client: Arc<Client>,
+    tunnel_id: TunnelId,
+    pool: Arc<ElasticPool>,
+    handler: Arc<H>,
+    sidebands: Arc<Sidebands>,
+) {
+    let permits = Arc::new(Semaphore::new(MAX_DATA_TRANSPORTS));
+    let mut workers = JoinSet::new();
+
+    loop {
+        while workers.try_join_next().is_some() {}
+        let needed = pool.deficit();
+        if needed > 0 {
+            let mut spawned = 0;
+            for _ in 0..needed {
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    break;
+                };
+                pool.opening_count.fetch_add(1, Ordering::AcqRel);
+                spawned += 1;
+                workers.spawn(run_data_transport(
+                    Arc::clone(&client),
+                    tunnel_id.clone(),
+                    permit,
+                    Arc::clone(&pool),
+                    Arc::clone(&handler),
+                    Arc::clone(&sidebands),
+                ));
+            }
+            if spawned > 0 {
+                // Consume the satisfied portion of relay-reported demand.
+                let _ = pool.demand_count.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |d| Some(d.saturating_sub(spawned)),
+                );
+            } else {
+                pool.replenish.notified().await;
+            }
+            continue;
+        }
+        pool.replenish.notified().await;
+    }
+}
+
+async fn run_data_transport<H: Handler>(
+    client: Arc<Client>,
+    tunnel_id: TunnelId,
+    permit: OwnedSemaphorePermit,
+    pool: Arc<ElasticPool>,
+    handler: Arc<H>,
+    sidebands: Arc<Sidebands>,
+) {
+    // Drop order is reverse of declaration: `_permit` releases the semaphore
+    // slot first, then `_notify` wakes the supervisor if `idle < target_idle`.
+    let _notify = ReplenishOnDrop(Arc::clone(&pool));
+    let _permit = permit;
+
+    struct OpeningRelease<'a>(&'a AtomicUsize, bool);
+    impl Drop for OpeningRelease<'_> {
+        fn drop(&mut self) {
+            if self.1 {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+    let mut opening = OpeningRelease(&pool.opening_count, true);
+
+    let opened = open_data_transport(&client, &tunnel_id, &sidebands).await;
+    opening.1 = false;
+    pool.opening_count.fetch_sub(1, Ordering::AcqRel);
+
+    let (mut data, mut sideband) = match opened {
+        Ok(pair) => pair,
+        Err(error) => {
+            log_error("data transport failed", error.as_ref());
+            tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
+            return;
+        }
+    };
+
+    if let Err(error) = serve_visitors(&mut data, &mut sideband, &*handler, &pool).await {
+        log_error("data transport failed", error.as_ref());
+    }
+}
+
+async fn open_data_transport(
     client: &Client,
     tunnel_id: &TunnelId,
-    handler: &H,
     sidebands: &Arc<Sidebands>,
-) -> Result<()> {
+) -> Result<(TcpStream, Stream)> {
     let (mut data, transport_id) = client.request_data_transport(tunnel_id).await?;
-    let mut sideband = {
+    let sideband = {
         let (sideband, _expectation) = sidebands.expect(transport_id)?;
         data_transport::confirm(&mut data).await?;
         sideband
             .await
             .context("control sessions closed while adding a data transport")?
     };
-    serve_visitors(&mut data, &mut sideband, handler).await
+    Ok((data, sideband))
 }
 
-/// Serves visitors one after another over a data transport.
+/// Serves visitors one after another over a reusable data transport.
 async fn serve_visitors<H: Handler>(
     data: &mut TcpStream,
     sideband: &mut Stream,
     handler: &H,
+    pool: &ElasticPool,
 ) -> Result<()> {
+    let mut initial = [0_u8; INITIAL_READ_BUF_SIZE];
     loop {
-        let mut marker = [0; ACTIVATION_MARKER.len()];
-        data.read_exact(&mut marker)
-            .await
-            .context("relay closed an idle data transport")?;
-        if &marker != ACTIVATION_MARKER {
-            bail!("relay sent an invalid data transport activation marker");
-        }
+        let idle_guard = CounterGuard::enter(&pool.idle_count);
+        let initial_len = match read_activation_and_initial(data, &mut initial).await {
+            Ok(Some(len)) => len,
+            // Clean EOF while idle (for example, relay closed an excess
+            // post-burst transport). Exit cleanly without logging or sleeping.
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        drop(idle_guard);
+        pool.maybe_notify_replenish();
 
-        let mut visitor = SidebandStream::new(&mut *data, &mut *sideband);
+        let prefixed = PrefixedRead::new(&initial[ACTIVATION_MARKER.len()..initial_len], &mut *data);
+        let mut visitor = SidebandStream::new(prefixed, &mut *sideband);
         handler
             .handle(Visitor::new(&mut visitor))
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
-        tokio::io::copy(&mut visitor, &mut tokio::io::sink()).await?;
+        if !visitor.is_read_finished() {
+            drain_to_eof(&mut visitor).await?;
+        }
         visitor.shutdown().await?;
         visitor.finish().await?;
+    }
+}
+
+/// Reads `[ACTIVATION_MARKER | initial visitor bytes]` in a single `read()`
+/// syscall when the relay coalesces activation with the visitor ClientHello.
+/// Returns `Ok(None)` on clean EOF before any activation byte arrives.
+async fn read_activation_and_initial(
+    data: &mut TcpStream,
+    buf: &mut [u8],
+) -> Result<Option<usize>> {
+    let first = data
+        .read(buf)
+        .await
+        .context("relay closed an idle data transport")?;
+    if first == 0 {
+        return Ok(None);
+    }
+    let mut len = first;
+    while len < ACTIVATION_MARKER.len() {
+        let n = data
+            .read(&mut buf[len..ACTIVATION_MARKER.len()])
+            .await
+            .context("relay closed an idle data transport")?;
+        if n == 0 {
+            bail!("relay closed an idle data transport mid-marker");
+        }
+        len += n;
+    }
+    if &buf[..ACTIVATION_MARKER.len()] != ACTIVATION_MARKER {
+        bail!("relay sent an invalid data transport activation marker");
+    }
+    Ok(Some(len))
+}
+
+async fn drain_to_eof<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<()> {
+    let mut discard = [0_u8; 4096];
+    while reader.read(&mut discard).await? != 0 {}
+    Ok(())
+}
+
+/// Yields already-read initial bytes before delegating reads to `inner`.
+struct PrefixedRead<'a, S> {
+    prefix: &'a [u8],
+    offset: usize,
+    inner: S,
+}
+
+impl<'a, S> PrefixedRead<'a, S> {
+    fn new(prefix: &'a [u8], inner: S) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedRead<'_, S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.offset < this.prefix.len() {
+            let remaining = &this.prefix[this.offset..];
+            let take = remaining.len().min(buffer.remaining());
+            buffer.put_slice(&remaining[..take]);
+            this.offset += take;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(context, buffer)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedRead<'_, S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(context, buffer)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(context, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
     }
 }
 

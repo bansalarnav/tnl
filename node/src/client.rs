@@ -1,6 +1,11 @@
 //! Connections from a node to its relay's API and data transport port.
 
-use std::{error::Error, fmt, net::SocketAddr, sync::Arc};
+use std::{
+    error::Error,
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use rustls::{
@@ -16,6 +21,7 @@ use tnl_core::{
         CONTROL_SESSIONS_HEADER, MAX_CONTROL_SESSIONS, MAX_DATA_TRANSPORTS, PROTOCOL_VERSION,
         PROTOCOL_VERSION_HEADER, TRANSPORT_POOL_HEADER, TUNNEL_URL_HEADER, tunnel_path,
     },
+    quic,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -146,6 +152,60 @@ impl Client {
             .await
             .context("data transport handshake failed")?;
         Ok((stream, id))
+    }
+
+    /// Opens and authenticates a dedicated QUIC/UDP data connection to the relay.
+    pub async fn connect_quic(
+        &self,
+        tunnel_id: &TunnelId,
+    ) -> Result<(quinn::Endpoint, quinn::Connection)> {
+        let url = &self.config.api_url;
+        let host = url.host_str().context("API URL does not contain a host")?;
+        let port = url
+            .port_or_known_default()
+            .context("API URL does not contain a port")?;
+        let remote_addr = match self.config.connect_addr {
+            Some(address) => address,
+            None => tokio::net::lookup_host((host, port))
+                .await
+                .with_context(|| format!("could not resolve {host}:{port}"))?
+                .next()
+                .with_context(|| format!("no addresses resolved for {host}:{port}"))?,
+        };
+
+        let bind_addr = if remote_addr.is_ipv6() {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        };
+        let udp_socket =
+            quic::bind_udp_socket(bind_addr).context("could not bind QUIC client UDP socket")?;
+
+        let mut tls = (*self.config.tls).clone();
+        tls.alpn_protocols = vec![quic::QUIC_ALPN.to_vec()];
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
+            .context("could not build QUIC client TLS config")?;
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(crypto));
+        client_cfg.transport_config(quic::transport_config());
+
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            udp_socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .context("could not create QUIC client endpoint")?;
+        endpoint.set_default_client_config(client_cfg);
+
+        let conn = endpoint
+            .connect(remote_addr, host)
+            .context("could not start QUIC connection")?
+            .await
+            .with_context(|| format!("could not establish QUIC connection to {remote_addr}"))?;
+        quic::authenticate_client(&conn, tunnel_id, &self.transport_key)
+            .await
+            .context("QUIC data connection authentication failed")?;
+        Ok((endpoint, conn))
     }
 
     async fn connect_tcp(&self) -> Result<TcpStream> {

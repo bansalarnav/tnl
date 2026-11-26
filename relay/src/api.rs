@@ -26,8 +26,9 @@ use tnl_core::{
     TunnelId,
     data_transport::TransportKey,
     protocol::{
-        CONTROL_SESSIONS_HEADER, MAX_CONTROL_SESSIONS, MAX_DATA_TRANSPORTS, PROTOCOL_VERSION,
-        PROTOCOL_VERSION_HEADER, TRANSPORT_POOL_HEADER, TUNNEL_URL_HEADER, parse_tunnel_path,
+        CONTROL_SESSIONS_HEADER, DEFAULT_CONTROL_SESSIONS, DEFAULT_DATA_TRANSPORTS,
+        PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, TRANSPORT_POOL_HEADER, TUNNEL_URL_HEADER,
+        parse_tunnel_path,
     },
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -100,8 +101,8 @@ fn handle(relay: &Relay, mut request: Request<Incoming>) -> Response<Body> {
     let mut response = Response::new(Body::default());
     let headers = response.headers_mut();
     headers.insert(TUNNEL_URL_HEADER, url);
-    headers.insert(CONTROL_SESSIONS_HEADER, MAX_CONTROL_SESSIONS.into());
-    headers.insert(TRANSPORT_POOL_HEADER, MAX_DATA_TRANSPORTS.into());
+    headers.insert(CONTROL_SESSIONS_HEADER, DEFAULT_CONTROL_SESSIONS.into());
+    headers.insert(TRANSPORT_POOL_HEADER, DEFAULT_DATA_TRANSPORTS.into());
     headers.insert(
         PROTOCOL_VERSION_HEADER,
         HeaderValue::from_static(PROTOCOL_VERSION),

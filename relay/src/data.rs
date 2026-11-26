@@ -10,12 +10,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::Relay;
 
-pub(crate) async fn accept<S>(relay: &Relay, mut stream: S, first_byte: u8) -> Result<()>
+pub(crate) async fn accept<S>(relay: &Relay, mut stream: S, prefix: &[u8]) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let registry = &relay.inner.registry;
-    let tunnel_id = data_transport::read_request(&mut stream, first_byte)
+    let tunnel_id = data_transport::read_request_with_prefix(&mut stream, prefix)
         .await
         .context("invalid data transport request")?;
     let grant = registry
